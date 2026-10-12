@@ -5,6 +5,8 @@
 
 #include "h3_gpu.h"
 
+#include <mach-o/dyld.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -370,6 +372,24 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         NSString *source = [NSString stringWithContentsOfFile:path
                                                      encoding:NSUTF8StringEncoding
                                                         error:&libraryError];
+        if (!source && source_path[0] != '/') {
+            /* A relative shader path that is not in the current directory is
+             * looked up next to the executable, so h3 runs from anywhere. */
+            char executable[PATH_MAX];
+            uint32_t executable_size = sizeof(executable);
+            char resolved[PATH_MAX];
+            if (_NSGetExecutablePath(executable, &executable_size) == 0 &&
+                realpath(executable, resolved)) {
+                NSString *directory = [[NSString stringWithUTF8String:resolved]
+                    stringByDeletingLastPathComponent];
+                NSString *candidate = [directory stringByAppendingPathComponent:path];
+                NSError *candidateError = nil;
+                source = [NSString stringWithContentsOfFile:candidate
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:&candidateError];
+                if (source) path = candidate;
+            }
+        }
         if (source) {
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
