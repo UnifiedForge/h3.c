@@ -1,3 +1,86 @@
+# h3.c — UnifiedForge fork (runtime LoRA, tuned for M5)
+
+A maintained fork of [antirez/h3.c](https://github.com/antirez/h3.c), the
+native MiniMax-H3 video/audio engine for Apple Silicon, built on top of
+[neokree/h3.c](https://github.com/neokree/h3.c), which added runtime LoRA.
+Upstream is quiet and useful fixes sit in open pull requests; this fork
+collects them, adds our own work for M5 Macs, and is what
+[UnifiedForge](https://unifiedforge.dev) runs.
+
+This is an independent community project. It is not affiliated with MiniMax
+or with the upstream authors. The model weights are not included and are
+covered by MiniMax's own license.
+
+## What this fork changes
+
+| Change | Why | Origin |
+|---|---|---|
+| Runtime LoRA (`--lora PATH[:STRENGTH]`, several at once) | Load LoRAs without baking them into the checkpoint | neokree/h3.c |
+| Resume an interrupted denoise (`--resume PATH`) | A closed lid or a crash costs one step, not the whole run | neokree/h3.c |
+| Keep the int8 projections on M5 while a LoRA is loaded | Upstream runtime LoRA falls back to BF16 everywhere; ~25% faster with this change (table below) | UnifiedForge |
+| Barrier in the causal GQA reduction | Prompts above ~662 tokens decoded nondeterministically; now byte-identical run to run | antirez/h3.c#63 (quantz8a) |
+| Automatic video VAE tile capped at 288 px | Larger tiles leave a grid of small blocks on hair and sky edges | UnifiedForge |
+| Shader lookup next to the executable | `h3` works when started from any directory | antirez/h3.c#14 (guyz) |
+| Reject safetensors with an unaligned data section | Such files silently produced black video | antirez/h3.c#14 (guyz) |
+| Reference soundtrack clamped to 15 s | A 15 s reference video failed with "invalid FFmpeg audio input arguments" | UnifiedForge |
+
+## Speed on M5 (544x544, 5 s, seed 42)
+
+| Run | Before | This fork |
+|---|---|---|
+| Turbo LoRA v4, 6 steps | 3:04 | 2:17 |
+| Turbo LoRA v4, 8 steps | 3:42 | 2:49 |
+
+"Before" is neokree's runtime LoRA, which disables the int8 paths.
+`H3_LORA_BF16=1` restores that behaviour for comparison.
+
+## LoRA notes
+
+- Accepted: `lora_A/lora_B` or `lora_down/lora_up` pairs (optional `.alpha`),
+  BF16 or F32. F16 pairs, `.diff_b` biases, DoRA/LoKr/LoHa are refused with a
+  clear message; F16 converts to BF16 losslessly in practice.
+- The same file applies to FL2VA (text / first-last frame) and Ref2VA
+  (reference media): both transformers share the tensor layout.
+- Use all blocks with LoRA: `--layers 50 --reuse 1`. Partial layers or reused
+  steps drop part of the LoRA's effect.
+- Distilled turbo LoRAs: 6-8 steps. The lightx2v `*_768p_*` ones were
+  distilled at video shift 6 (`H3_VIDEO_SHIFT=6`).
+- On M5, `--resume` needs the host sampler: set `H3_CPU_SAMPLER=1`
+  (measured cost 0.1-0.3%).
+- See [docs/lora.md](docs/lora.md) for the full format.
+
+## Build
+
+```sh
+make -j8
+./h3 --info -d ./MiniMax-H3
+```
+
+Requires macOS on Apple Silicon, Xcode command line tools, FFmpeg/FFprobe on
+`PATH`, and the MiniMax-H3 weights from Hugging Face. The full CLI tutorial
+from upstream follows below.
+
+## Status and support
+
+Provided as is, without warranty. Fixes land when we can. We test on M5;
+other chips should work as they do upstream, but are not tested here.
+Questions and results are welcome in Discussions.
+
+## Credits
+
+- **Salvatore Sanfilippo (antirez)** — h3.c, the engine itself (MIT).
+- **NeoKree** — runtime LoRA, resume and the scheduling work this fork starts
+  from.
+- **quantz8a** — GQA reduction barrier (antirez/h3.c#63).
+- **guyz** — shader path and safetensors alignment fixes (antirez/h3.c#14).
+- **Liu Liu / ccv** — int8 / TensorOps kernel design, see
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
+*Upstream README (antirez/h3.c, with neokree's additions) continues below.*
+
+
 # h3-metal
 
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
