@@ -673,7 +673,10 @@ static int configured_tile_pixels(int pixel_height, int pixel_width) {
     }
     int best = TILE_PIXELS;
     uint64_t best_score = UINT64_MAX;
-    for (int pixels = TILE_PIXELS; pixels <= 320;
+    /* Tiles above 288 show a block/grid pattern on hair and sky edges
+     * (576x1024 picked 320 and showed it; 512 in one tile is far worse).
+     * 288 is the largest size that stayed clean in A/B tests on M5. */
+    for (int pixels = TILE_PIXELS; pixels <= 288;
          pixels += SPATIAL_RATIO) {
         uint64_t tiles = (uint64_t)tile_count_for_extent(pixel_height, pixels) *
             (uint64_t)tile_count_for_extent(pixel_width, pixels);
