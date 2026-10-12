@@ -1181,6 +1181,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 }
                 max_samples = (int)llround(
                     (double)condition_frames[visual] * 32000.0 / H3_FPS);
+                /* The audio reader caps references at 15 s (h3_ffmpeg.c),
+                 * but frame alignment can make a 15 s clip ask for 15.08 s
+                 * and the whole run fails with "invalid FFmpeg audio input
+                 * arguments". Truncation is already on for this path, so
+                 * clamp instead of failing. */
+                if (max_samples > 32000 * 15) max_samples = 32000 * 15;
                 if (max_samples < 64000) {
                     h3_set_error(ctx,
                         "video soundtrack %zu requires at least 2 seconds; "
