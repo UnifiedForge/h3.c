@@ -852,6 +852,65 @@ static int lora_branch(h3_dit *dit, const h3_lora_site *site,
                                    output_dim, "LoRA", error, error_size);
 }
 
+/* UnifiedForge debug: H3_LORA_PROBE=1 measures, once per label, how much the
+ * LoRA branch actually changes y (submit/readback around the branch). */
+static int lora_branch_probe(h3_dit *dit, const h3_lora_site *site,
+                             h3_gpu_tensor *y, const h3_gpu_tensor *x,
+                             uint32_t rows, uint32_t input_dim,
+                             uint32_t output_dim, const char *label,
+                             char *error, size_t error_size) {
+    static char done[8][48];
+    static int done_count = 0;
+    int want = getenv("H3_LORA_PROBE") && site->count && done_count < 8;
+    for (int i = 0; want && i < done_count; i++)
+        if (!strcmp(done[i], label)) want = 0;
+    if (!want)
+        return lora_branch(dit, site, y, x, rows, input_dim, output_dim,
+                           error, error_size);
+    snprintf(done[done_count++], sizeof(done[0]), "%s", label);
+    size_t n = (size_t)rows * output_dim;
+    if (n > ((size_t)1 << 22)) n = (size_t)1 << 22;
+    float *a = malloc(n * sizeof(float)), *b = malloc(n * sizeof(float));
+    float *d = malloc(n * sizeof(float));
+    uint16_t *raw = malloc(n * sizeof(uint16_t));
+    int st[6] = {0};
+    int ok = a && b && d && raw &&
+             (st[0] = h3_gpu_submit(dit->gpu)) &&
+             (st[1] = h3_gpu_tensor_read_bf16(y, raw, n)) &&
+             (st[2] = h3_gpu_begin(dit->gpu)) &&
+             lora_branch(dit, site, y, x, rows, input_dim, output_dim,
+                         error, error_size);
+    if (ok) for (size_t i = 0; i < n; i++) {
+        uint32_t u = (uint32_t)raw[i] << 16; memcpy(&a[i], &u, 4); }
+    ok = ok && (st[3] = h3_gpu_submit(dit->gpu)) &&
+         (st[4] = h3_gpu_tensor_read_bf16(y, raw, n));
+    if (ok) for (size_t i = 0; i < n; i++) {
+        uint32_t u = (uint32_t)raw[i] << 16; memcpy(&b[i], &u, 4); }
+    ok = ok && h3_gpu_tensor_read_bf16(dit->lora_delta, raw, n);
+    if (ok) for (size_t i = 0; i < n; i++) {
+        uint32_t u = (uint32_t)raw[i] << 16; memcpy(&d[i], &u, 4); }
+    ok = ok && (st[5] = h3_gpu_begin(dit->gpu));
+    if (!ok) fprintf(stderr, "h3 probe steps: %d %d %d %d %d %d (%s)\n",
+                     st[0], st[1], st[2], st[3], st[4], st[5],
+                     h3_gpu_error(dit->gpu));
+    free(raw);
+    if (ok) {
+        double ya = 0, dy = 0, dd = 0;
+        for (size_t i = 0; i < n; i++) {
+            ya += (double)a[i] * a[i];
+            dy += (double)(b[i] - a[i]) * (b[i] - a[i]);
+            dd += (double)d[i] * d[i];
+        }
+        fprintf(stderr, "h3 probe %s: |y|=%.4g |y_after-y_before|=%.4g "
+                "|delta buffer|=%.4g (n=%zu)\n", label, sqrt(ya), sqrt(dy),
+                sqrt(dd), n);
+    } else {
+        fprintf(stderr, "h3 probe %s: failed\n", label);
+    }
+    free(a); free(b); free(d);
+    return ok;
+}
+
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
@@ -1770,15 +1829,26 @@ static h3_dit *load_dit(const char *weight_directory,
      * delta. With an empty set nothing here runs and the dispatch loop is the
      * one h3 had before (H4). */
     if (loras && loras->count) {
+        /* UnifiedForge (M5): keep the int8 tensor-op projections and add the
+         * LoRA delta after each UNFUSED int8 linear. The fused kernels hide
+         * the raw projection, so they are bypassed; the heavy matmul stays
+         * int8. H3_LORA_BF16=1 restores the upstream all-bf16 branch. */
+        int lora_int8 = getenv("H3_LORA_BF16") == NULL &&
+            (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out);
         dit->fused_mlp = 0;
         dit->nax_mlp = 0;
-        dit->int8_mlp = 0;
-        dit->int8_qkv = 0;
-        dit->int8_attention_out = 0;
         dit->keep_bf16_qkv = 0;
         dit->keep_bf16_attention_out = 0;
         dit->keep_bf16_mlp = 0;
         dit->use_int8_row_fc2 = 0;
+        if (lora_int8) {
+            dit->use_slower_unfused_int8_inputs = 1;
+            dit->use_slower_row_major_attention_output = 1;
+        } else {
+            dit->int8_mlp = 0;
+            dit->int8_qkv = 0;
+            dit->int8_attention_out = 0;
+        }
         dit->loras = loras;
         uint64_t max_rank = 0, max_out_dim = 0;
         h3_lora_set_extents(loras, &max_rank, &max_out_dim);
@@ -2038,7 +2108,20 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (dit->int8_qkv && weight->lora_qkv.count) {
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, dit->qkv, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_attention,
+            weight->qkv_int8, weight->qkv_scales, rows, HIDDEN, INNER * 3,
+            dit->use_slower_uncached_int8_scales),
+           "DiT int8 QKV projection (LoRA)");
+        if (!lora_branch_probe(dit, &weight->lora_qkv, dit->qkv, dit->mod_attention,
+                         rows, HIDDEN, INNER * 3, "int8 qkv", error, error_size)) return 0;
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows, HEADS,
+            HEAD_DIM, ROPE_HALF, 1e-5f), "DiT QKV norm/RoPE (LoRA)");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -2058,8 +2141,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->qkv, dit->mod_attention,
             weight->qkv, NULL, rows, HIDDEN, INNER * 3),
            "DiT QKV projection");
-        if (!lora_branch(dit, &weight->lora_qkv, dit->qkv, dit->mod_attention,
-                         rows, HIDDEN, INNER * 3, error, error_size)) return 0;
+        if (!lora_branch_probe(dit, &weight->lora_qkv, dit->qkv, dit->mod_attention,
+                         rows, HIDDEN, INNER * 3, "bf16 qkv", error, error_size)) return 0;
         OP(h3_gpu_grouped_qkv_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows, HEADS,
@@ -2101,6 +2184,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
                 dit->use_slower_uncached_int8_scales),
                "DiT int8 attention output");
+        /* row-major input is forced while a LoRA set is active */
+        if (!head_major_attention_output &&
+            !lora_branch_probe(dit, &weight->lora_out, dit->attention_output,
+                         dit->attention_heads, rows, INNER, HIDDEN,
+                         "int8 out", error, error_size)) return 0;
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
@@ -2140,6 +2228,26 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
     if (dit->int8_mlp &&
+        (weight->lora_fc1.count || weight->lora_fc2.count)) {
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, dit->fc1, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_mlp,
+            weight->fc1_int8, weight->fc1_scales, rows, HIDDEN, FFN * 2,
+            dit->use_slower_uncached_int8_scales),
+           "DiT int8 MLP input (LoRA)");
+        if (!lora_branch_probe(dit, &weight->lora_fc1, dit->fc1, dit->mod_mlp, rows,
+                         HIDDEN, FFN * 2, "int8 fc1", error, error_size)) return 0;
+        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT SwiGLU (LoRA)");
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, mlp_output, dit->int8_activation,
+            dit->int8_activation_scales, dit->activated,
+            weight->fc2_int8, weight->fc2_scales, rows, FFN, HIDDEN,
+            dit->use_slower_uncached_int8_scales),
+           "DiT int8 MLP output (LoRA)");
+        if (!lora_branch_probe(dit, &weight->lora_fc2, mlp_output, dit->activated,
+                         rows, FFN, HIDDEN, "int8 fc2", error, error_size)) return 0;
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
