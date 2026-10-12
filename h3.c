@@ -526,8 +526,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (params->frames < 5 || h3_align_frame_count(params->frames) > 362) {
-        h3_set_error(ctx, "frames must align within the released 5..362 range");
+    /* The released workflow targets 362 frames; longer clips are allowed
+     * but not validated. */
+    if (params->frames < 5 || h3_align_frame_count(params->frames) > 1450) {
+        h3_set_error(ctx, "frames must align within the 5..1450 range");
         return 0;
     }
     if (params->steps < 2 || params->steps > H3_MAX_STEPS) {
