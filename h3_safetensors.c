@@ -446,6 +446,17 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         close(descriptor);
         return 0;
     }
+    if ((8 + header_size) % 8 != 0) {
+        /* Valid per the spec, but tensors are read in place assuming 8-byte
+         * alignment, and an unpadded header decodes to garbage (black video
+         * with intact audio). MLX save_safetensors writes such files. */
+        if (error && error_size)
+            snprintf(error, error_size, "%s: tensor data is not 8-byte aligned "
+                     "(header %llu bytes); re-save it with a padded header",
+                     path, (unsigned long long)header_size);
+        close(descriptor);
+        return 0;
+    }
     char *json = malloc((size_t)header_size + 1);
     if (!json || pread(descriptor, json, (size_t)header_size, 8) != (ssize_t)header_size) {
         if (error && error_size) snprintf(error, error_size, "%s: cannot read header", path);
