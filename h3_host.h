@@ -65,6 +65,9 @@ typedef struct {
     size_t keyframe_count;
     const h3_layout_ref *references;
     size_t reference_count;
+    /* Latent frames of an aligned guide clip anchored at target frame 0, or
+     * 0 for none. Its rows come first, before any references. */
+    int guide_latent_t;
 } h3_layout_spec;
 
 typedef struct {

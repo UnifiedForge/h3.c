@@ -144,12 +144,14 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     h3_key key = {0};
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
-    if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
+    if (!ref2va && !params->first_frame && !params->last_frame &&
+        !params->guide_video) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
                        params->reference_image_size) ||
         !h3_key_file(&key, "first", params->first_frame) ||
-        !h3_key_file(&key, "last", params->last_frame)) goto failed;
+        !h3_key_file(&key, "last", params->last_frame) ||
+        !h3_key_file(&key, "guide", params->guide_video)) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!h3_key_append(&key, "|ref=%d:%d", reference->kind,
@@ -609,6 +611,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
         return 0;
     }
+    if (params->guide_video && (params->first_frame || params->last_frame)) {
+        h3_set_error(ctx, "a guide video cannot be combined with frame anchors");
+        return 0;
+    }
     size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
@@ -862,6 +868,147 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
+/* UnifiedForge guide: read the clip on the target canvas, crop it to the
+ * longest valid 17k+5 length that fits the output, VAE-encode it, patchify,
+ * augment it like every other condition (same seeded stream, restarted per
+ * condition) and prepend its rows: guide rows come before references, both in
+ * the packed layout and in the condition buffer. */
+static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
+                            h3_generation_progress *progress,
+                            const char *vae_path,
+                            int render_width, int render_height,
+                            int frame_count, int latent_w, int latent_h,
+                            float **rows_io, size_t *elements_io,
+                            int *guide_latent_t) {
+    char detail[512];
+    float *pixels = NULL;
+    int frames = 0;
+    h3_video_latent latent;
+    memset(&latent, 0, sizeof(latent));
+    float *combined = NULL;
+    if (!h3_ffmpeg_read_video_f32(params->guide_video, render_width,
+                                  render_height, frame_count, &pixels, &frames,
+                                  detail, sizeof(detail))) {
+        h3_set_error(ctx, "guide video: %s", detail);
+        return 0;
+    }
+    int usable = frames;
+    if (usable > frame_count) usable = frame_count;
+    while (usable >= 5 && usable % 17 != 5) usable--;
+    if (usable < 5) {
+        free(pixels);
+        h3_set_error(ctx, "guide video is too short (%d frames, need at least 5)",
+                     frames);
+        return 0;
+    }
+    if (usable < frame_count)
+        fprintf(stderr, "h3: guide covers %d of %d frames\n", usable, frame_count);
+    /* Encode the way ComfyUI's MiniMax VAE does (encode_temporal): 17-frame
+     * clips, the last one padded by repeating its final frame, each giving 5
+     * latent frames, then the trailing 3 tokens dropped. That makes 17k+5
+     * frames land on exactly the target's 5k+2 latent frames, token for
+     * token. Encoding the whole clip causally (as reference videos are) gives
+     * (N+3)/4 latents and the guide drifts against the target timeline. */
+    const int clip_frames = 17, clip_latents = 5, token_drop = 3;
+    int clips = (usable + clip_frames - 1) / clip_frames;
+    int latent_t = clips * clip_latents - token_drop;
+    size_t area = (size_t)render_height * (size_t)render_width;
+    size_t latent_area = (size_t)latent_h * (size_t)latent_w;
+    size_t span = (size_t)latent_t * latent_area / 4 * 96;
+    float *chunk = malloc(3 * (size_t)clip_frames * area * sizeof(*chunk));
+    float *joined = malloc(24 * (size_t)clips * clip_latents * latent_area *
+                           sizeof(*joined));
+    if (!chunk || !joined) {
+        free(chunk);
+        free(joined);
+        free(pixels);
+        h3_set_error(ctx, "out of memory encoding the guide video");
+        return 0;
+    }
+    for (int clip = 0; clip < clips; clip++) {
+        for (int channel = 0; channel < 3; channel++)
+            for (int frame = 0; frame < clip_frames; frame++) {
+                int source = clip * clip_frames + frame;
+                if (source >= usable) source = usable - 1;
+                memcpy(chunk + ((size_t)channel * clip_frames + frame) * area,
+                       pixels + ((size_t)channel * frames + source) * area,
+                       area * sizeof(*chunk));
+            }
+        if (!h3_video_vae_encode(vae_path, "h3_shaders.metal", chunk,
+                                 clip_frames, render_height, render_width,
+                                 h3_video_encoder_progress_bridge, progress,
+                                 &latent, detail, sizeof(detail))) {
+            free(chunk);
+            free(joined);
+            free(pixels);
+            h3_video_latent_free(&latent);
+            h3_set_error(ctx, "guide video: %s", detail);
+            return 0;
+        }
+        if (latent.time != clip_latents || latent.height != latent_h ||
+            latent.width != latent_w) {
+            free(chunk);
+            free(joined);
+            free(pixels);
+            h3_video_latent_free(&latent);
+            h3_set_error(ctx, "guide VAE produced unexpected latent geometry");
+            return 0;
+        }
+        for (int channel = 0; channel < 24; channel++)
+            memcpy(joined + ((size_t)channel * clips * clip_latents +
+                             (size_t)clip * clip_latents) * latent_area,
+                   latent.values + (size_t)channel * clip_latents * latent_area,
+                   (size_t)clip_latents * latent_area * sizeof(*joined));
+        h3_video_latent_free(&latent);
+        if (progress->cancelled) {
+            free(chunk);
+            free(joined);
+            free(pixels);
+            return 0;
+        }
+    }
+    free(chunk);
+    free(pixels);
+    /* Drop the trailing tokens: keep the first latent_t of every channel. */
+    for (int channel = 1; channel < 24; channel++)
+        memmove(joined + (size_t)channel * latent_t * latent_area,
+                joined + (size_t)channel * clips * clip_latents * latent_area,
+                (size_t)latent_t * latent_area * sizeof(*joined));
+    latent.values = joined;
+    latent.time = latent_t;
+    latent.height = latent_h;
+    latent.width = latent_w;
+    if (span > SIZE_MAX / sizeof(float) - *elements_io) {
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "guide row count overflows");
+        return 0;
+    }
+    combined = malloc((span + *elements_io) * sizeof(*combined));
+    if (!combined) {
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "out of memory packing the guide video");
+        return 0;
+    }
+    if (!h3_dit_patchify_video(latent.values, 24, latent_t, latent_h, latent_w,
+                               combined, span)) {
+        h3_video_latent_free(&latent);
+        free(combined);
+        h3_set_error(ctx, "cannot patchify the guide latent");
+        return 0;
+    }
+    h3_video_latent_free(&latent);
+    h3_augment_span(combined, span, params->seed);
+    if (*elements_io)
+        memcpy(combined + span, *rows_io, *elements_io * sizeof(*combined));
+    free(*rows_io);
+    *rows_io = combined;
+    *elements_io += span;
+    *guide_latent_t = latent_t;
+    fprintf(stderr, "h3: guide video %d frames -> %d latent frames\n",
+            usable, latent_t);
+    return 1;
+}
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
@@ -881,8 +1028,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     int ref2va = params->reference_count != 0;
-    if (ref2va && !ctx->model.ref2va_transformer.files) {
-        h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
+    /* A guide runs on the Ref2VA DiT even without references (the guide
+     * LoRAs were trained there); text then stays a plain prompt, as t2va. */
+    int ref2va_model = ref2va || params->guide_video != NULL;
+    if (ref2va_model && !ctx->model.ref2va_transformer.files) {
+        h3_set_error(ctx, ref2va ?
+            "ordered references require the Ref2VA checkpoint" :
+            "a guide video requires the Ref2VA checkpoint");
         return NULL;
     }
     h3_generation_progress progress = {ctx, params, 0};
@@ -911,6 +1063,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t keyframe_count = 0;
     float *condition_video_rows = NULL;
     size_t condition_video_elements = 0;
+    int guide_latent_t = 0;
     float *condition_audio_rows = NULL;
     size_t condition_audio_elements = 0;
     h3_text_embedding text;
@@ -943,15 +1096,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int conditioned = 0;
     int dit_is_cached = 0;
     int decoder_is_cached = 0;
-    char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
+    char *tokenizer_path = h3_path(ctx->model_dir, ref2va_model ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
-    char *text_path = h3_path(ctx->model_dir, ref2va ?
+    char *text_path = h3_path(ctx->model_dir, ref2va_model ?
         "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
+    char *dit_path = h3_path(ctx->model_dir, ref2va_model ?
         "Ref2VA/transformer" : "FL2VA/transformer");
-    char *vae_path = h3_path(ctx->model_dir, ref2va ?
+    char *vae_path = h3_path(ctx->model_dir, ref2va_model ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
-    char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
+    char *audio_vae_path = h3_path(ctx->model_dir, ref2va_model ?
         "Ref2VA/audio_vae" : "FL2VA/audio_vae");
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
@@ -1490,13 +1643,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "cannot apply seeded condition augmentation");
         goto cleanup;
     }
+    if (params->guide_video) {
+        if (!h3_prepend_guide(ctx, params, &progress, vae_path,
+                              render_width, render_height,
+                              temporal.frame_count, latent_w, latent_h,
+                              &condition_video_rows,
+                              &condition_video_elements,
+                              &guide_latent_t)) goto cleanup;
+        conditioned = 1;
+    }
     if (progress.cancelled) goto cleanup;
 
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
                            keyframes, keyframe_count,
                            layout_references,
-                           ref2va ? params->reference_count : 0};
+                           ref2va ? params->reference_count : 0,
+                           guide_latent_t};
     if (!h3_layout_build(&spec, &layout, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;

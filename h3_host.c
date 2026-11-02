@@ -399,6 +399,31 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     free(text);
 
     double cursor = (double)spec->text_len;
+    if (spec->guide_latent_t > 0) {
+        if (spec->keyframe_count) {
+            h3_builder_fail(&builder, "a guide clip cannot be combined with frame anchors");
+            goto fail;
+        }
+        /* Same origin as the target timeline: text, then every reference
+         * span (ComfyUI PackedLayout keyframes). */
+        double origin = (double)spec->text_len;
+        for (size_t index = 0; index < spec->reference_count; index++) {
+            const h3_layout_ref *reference = &spec->references[index];
+            if (reference->kind == H3_LAYOUT_REF_IMAGE) origin += 1.0;
+            else if (reference->kind == H3_LAYOUT_REF_AUDIO)
+                origin += reference->audio_t;
+            else origin += fmax((double)reference->audio_t,
+                                h3_video_span_sum(reference->latent_t));
+        }
+        size_t guide_rows = 0;
+        h3_position *guide = h3_video_grid(origin, spec->guide_latent_t,
+                                           frame, frame_rows, &guide_rows);
+        if (!guide) goto oom;
+        int ok = h3_emit(&builder, H3_SEG_COND, guide, guide_rows);
+        free(guide);
+        if (!ok) goto fail;
+        layout->img_cond_rows += guide_rows;
+    }
     for (size_t index = 0; index < spec->keyframe_count; index++) {
         double condition_time;
         if (spec->keyframes[index] == 0) {

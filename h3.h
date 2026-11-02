@@ -148,6 +148,13 @@ typedef struct {
     h3_progress_callback on_progress;
     h3_report_callback on_report;
     void *callback_opaque;
+    /* UnifiedForge: aligned source-video guide (ComfyUI MiniMaxH3AddGuide at
+     * frame_idx 0). The clip is VAE-encoded on the target canvas and packed
+     * as clean condition rows that share the target's spatial and temporal
+     * grid, so the output follows its motion, timing and framing. Runs on the
+     * Ref2VA DiT; may be combined with references. Meant for guide-trained
+     * LoRAs (sharpen, character swap _gl, style transfer, VFX edit). */
+    const char *guide_video;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
