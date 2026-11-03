@@ -54,6 +54,10 @@ static void usage(const char *program) {
         "                         this same run (delete it to start over)\n"
         "      --guide-video PATH Aligned source-video guide on the Ref2VA DiT\n"
         "                         (for guide-trained LoRAs)\n"
+        "      --init-video PATH  Refine pass: start from this clip renoised\n"
+        "                         to the first sigma (with --sigmas)\n"
+        "      --sigmas LIST      Explicit video sigmas, e.g. 0.909375,0.857143,\n"
+        "                         0.666667,0 (overrides --steps)\n"
         "      --lora PATH[:STRENGTH]  Apply a LoRA adapter (default 1.0,\n"
         "                         repeatable)\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
@@ -283,7 +287,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -334,6 +338,8 @@ int main(int argc, char **argv) {
         {"lora", required_argument, NULL, OPT_LORA},
         {"resume", required_argument, NULL, OPT_RESUME},
         {"guide-video", required_argument, NULL, OPT_GUIDE_VIDEO},
+        {"init-video", required_argument, NULL, OPT_INIT_VIDEO},
+        {"sigmas", required_argument, NULL, OPT_SIGMAS},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
@@ -495,6 +501,8 @@ int main(int argc, char **argv) {
             }
             case OPT_RESUME: params.resume_path = optarg; break;
             case OPT_GUIDE_VIDEO: params.guide_video = optarg; break;
+            case OPT_INIT_VIDEO: params.init_video = optarg; break;
+            case OPT_SIGMAS: params.custom_sigmas = optarg; break;
             case OPT_LORA: parse_lora(optarg, &loras[lora_count++]); break;
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;

@@ -145,13 +145,17 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
     if (!ref2va && !params->first_frame && !params->last_frame &&
-        !params->guide_video) return key.text;
+        !params->guide_video && !params->init_video &&
+        !params->custom_sigmas) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
                        params->reference_image_size) ||
         !h3_key_file(&key, "first", params->first_frame) ||
         !h3_key_file(&key, "last", params->last_frame) ||
-        !h3_key_file(&key, "guide", params->guide_video)) goto failed;
+        !h3_key_file(&key, "guide", params->guide_video) ||
+        !h3_key_file(&key, "init", params->init_video) ||
+        !h3_key_append(&key, "|sigmas=%s",
+                       params->custom_sigmas ? params->custom_sigmas : "")) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!h3_key_append(&key, "|ref=%d:%d", reference->kind,
@@ -506,8 +510,21 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "width and height must be multiples of 32 and at least 32");
         return 0;
     }
-    if ((int64_t)params->width * params->height > H3_MAX_PIXELS) {
-        h3_set_error(ctx, "canvas exceeds the released 768*1344 pixel limit");
+    /* A refine pass (--init-video) redraws an existing clip at a higher
+     * resolution with a LoRA trained for it (Open-H3-Regenerate goes to 4K);
+     * plain generation keeps the released limit. */
+    if ((int64_t)params->width * params->height >
+        (params->init_video ? (int64_t)3840 * 2176 : (int64_t)H3_MAX_PIXELS)) {
+        h3_set_error(ctx, params->init_video ?
+            "refine canvas exceeds 3840*2176" :
+            "canvas exceeds the released 768*1344 pixel limit");
+        return 0;
+    }
+    /* First/last-frame anchors stay allowed: on a refine they pin the
+     * subject's identity (e.g. a sharp still of the clip's own first frame). */
+    if (params->init_video && (params->reference_count || params->guide_video)) {
+        h3_set_error(ctx, "an init video is a refine pass on the FL2VA DiT: no "
+                     "Ref2VA references or guide");
         return 0;
     }
     if ((params->render_width == 0) != (params->render_height == 0)) {
@@ -868,28 +885,31 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
-/* UnifiedForge guide: read the clip on the target canvas, crop it to the
- * longest valid 17k+5 length that fits the output, VAE-encode it, patchify,
- * augment it like every other condition (same seeded stream, restarted per
- * condition) and prepend its rows: guide rows come before references, both in
- * the packed layout and in the condition buffer. */
-static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
-                            h3_generation_progress *progress,
-                            const char *vae_path,
-                            int render_width, int render_height,
-                            int frame_count, int latent_w, int latent_h,
-                            float **rows_io, size_t *elements_io,
-                            int *guide_latent_t) {
+/* UnifiedForge: read a clip on the target canvas, crop it to the longest
+ * valid 17k+5 length that fits the output, and VAE-encode it the way
+ * ComfyUI's MiniMax VAE does (encode_temporal): 17-frame clips, the last one
+ * padded by repeating its final frame, each giving 5 latent frames, then the
+ * trailing 3 tokens dropped. That makes 17k+5 frames land on exactly the
+ * target's 5k+2 latent frames, token for token. Encoding the whole clip
+ * causally (as reference videos are) gives (N+3)/4 latents and drifts against
+ * the target timeline. Returns a channel-major [24, latent_t, h, w] latent. */
+static int h3_encode_clip_aligned(h3_ctx *ctx, const char *what,
+                                  const char *path,
+                                  h3_generation_progress *progress,
+                                  const char *vae_path,
+                                  int render_width, int render_height,
+                                  int frame_count, int latent_w, int latent_h,
+                                  h3_video_latent *out, int *usable_out) {
     char detail[512];
     float *pixels = NULL;
     int frames = 0;
     h3_video_latent latent;
     memset(&latent, 0, sizeof(latent));
-    float *combined = NULL;
-    if (!h3_ffmpeg_read_video_f32(params->guide_video, render_width,
-                                  render_height, frame_count, &pixels, &frames,
+    memset(out, 0, sizeof(*out));
+    if (!h3_ffmpeg_read_video_f32(path, render_width, render_height,
+                                  frame_count, &pixels, &frames,
                                   detail, sizeof(detail))) {
-        h3_set_error(ctx, "guide video: %s", detail);
+        h3_set_error(ctx, "%s: %s", what, detail);
         return 0;
     }
     int usable = frames;
@@ -897,24 +917,15 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
     while (usable >= 5 && usable % 17 != 5) usable--;
     if (usable < 5) {
         free(pixels);
-        h3_set_error(ctx, "guide video is too short (%d frames, need at least 5)",
-                     frames);
+        h3_set_error(ctx, "%s is too short (%d frames, need at least 5)",
+                     what, frames);
         return 0;
     }
-    if (usable < frame_count)
-        fprintf(stderr, "h3: guide covers %d of %d frames\n", usable, frame_count);
-    /* Encode the way ComfyUI's MiniMax VAE does (encode_temporal): 17-frame
-     * clips, the last one padded by repeating its final frame, each giving 5
-     * latent frames, then the trailing 3 tokens dropped. That makes 17k+5
-     * frames land on exactly the target's 5k+2 latent frames, token for
-     * token. Encoding the whole clip causally (as reference videos are) gives
-     * (N+3)/4 latents and the guide drifts against the target timeline. */
     const int clip_frames = 17, clip_latents = 5, token_drop = 3;
     int clips = (usable + clip_frames - 1) / clip_frames;
     int latent_t = clips * clip_latents - token_drop;
     size_t area = (size_t)render_height * (size_t)render_width;
     size_t latent_area = (size_t)latent_h * (size_t)latent_w;
-    size_t span = (size_t)latent_t * latent_area / 4 * 96;
     float *chunk = malloc(3 * (size_t)clip_frames * area * sizeof(*chunk));
     float *joined = malloc(24 * (size_t)clips * clip_latents * latent_area *
                            sizeof(*joined));
@@ -922,7 +933,7 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
         free(chunk);
         free(joined);
         free(pixels);
-        h3_set_error(ctx, "out of memory encoding the guide video");
+        h3_set_error(ctx, "out of memory encoding the %s", what);
         return 0;
     }
     for (int clip = 0; clip < clips; clip++) {
@@ -942,7 +953,7 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
             free(joined);
             free(pixels);
             h3_video_latent_free(&latent);
-            h3_set_error(ctx, "guide video: %s", detail);
+            h3_set_error(ctx, "%s: %s", what, detail);
             return 0;
         }
         if (latent.time != clip_latents || latent.height != latent_h ||
@@ -951,7 +962,7 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
             free(joined);
             free(pixels);
             h3_video_latent_free(&latent);
-            h3_set_error(ctx, "guide VAE produced unexpected latent geometry");
+            h3_set_error(ctx, "%s VAE produced unexpected latent geometry", what);
             return 0;
         }
         for (int channel = 0; channel < 24; channel++)
@@ -974,16 +985,42 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
         memmove(joined + (size_t)channel * latent_t * latent_area,
                 joined + (size_t)channel * clips * clip_latents * latent_area,
                 (size_t)latent_t * latent_area * sizeof(*joined));
-    latent.values = joined;
-    latent.time = latent_t;
-    latent.height = latent_h;
-    latent.width = latent_w;
+    out->values = joined;
+    out->time = latent_t;
+    out->height = latent_h;
+    out->width = latent_w;
+    *usable_out = usable;
+    return 1;
+}
+
+/* UnifiedForge guide: encode the clip aligned to the target timeline,
+ * patchify, augment it like every other condition (same seeded stream,
+ * restarted per condition) and prepend its rows: guide rows come before
+ * references, both in the packed layout and in the condition buffer. */
+static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
+                            h3_generation_progress *progress,
+                            const char *vae_path,
+                            int render_width, int render_height,
+                            int frame_count, int latent_w, int latent_h,
+                            float **rows_io, size_t *elements_io,
+                            int *guide_latent_t) {
+    h3_video_latent latent;
+    int usable = 0;
+    if (!h3_encode_clip_aligned(ctx, "guide video", params->guide_video,
+                                progress, vae_path, render_width,
+                                render_height, frame_count, latent_w,
+                                latent_h, &latent, &usable))
+        return 0;
+    if (usable < frame_count)
+        fprintf(stderr, "h3: guide covers %d of %d frames\n", usable, frame_count);
+    int latent_t = latent.time;
+    size_t span = (size_t)latent_t * (size_t)latent_h * (size_t)latent_w / 4 * 96;
     if (span > SIZE_MAX / sizeof(float) - *elements_io) {
         h3_video_latent_free(&latent);
         h3_set_error(ctx, "guide row count overflows");
         return 0;
     }
-    combined = malloc((span + *elements_io) * sizeof(*combined));
+    float *combined = malloc((span + *elements_io) * sizeof(*combined));
     if (!combined) {
         h3_video_latent_free(&latent);
         h3_set_error(ctx, "out of memory packing the guide video");
@@ -1006,6 +1043,115 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
     *guide_latent_t = latent_t;
     fprintf(stderr, "h3: guide video %d frames -> %d latent frames\n",
             usable, latent_t);
+    return 1;
+}
+
+/* UnifiedForge refine (Open-H3-Regenerate style): replace the pure-noise
+ * start with the encoded clip renoised to the first sigma of the schedule,
+ * x = (1 - s) * clean + s * noise, per stream. The clip must cover the whole
+ * output (the caller sizes the run to it). The soundtrack is encoded too when
+ * the clip has one and its length matches; otherwise audio starts from noise
+ * (the wrapper replaces it with the original track anyway). */
+static int h3_apply_init_clip(h3_ctx *ctx, const h3_params *params,
+                              h3_generation_progress *progress,
+                              const char *vae_path, const char *audio_vae_path,
+                              int render_width, int render_height,
+                              const h3_temporal_shape *temporal,
+                              int latent_w, int latent_h,
+                              const h3_sigma_schedule *sigmas,
+                              float *video, size_t video_count,
+                              float *audio, size_t audio_count) {
+    h3_video_latent latent;
+    int usable = 0;
+    if (!h3_encode_clip_aligned(ctx, "init video", params->init_video,
+                                progress, vae_path, render_width,
+                                render_height, temporal->frame_count,
+                                latent_w, latent_h, &latent, &usable))
+        return 0;
+    if (latent.time != temporal->video_t ||
+        (size_t)24 * latent.time * latent_h * latent_w != video_count) {
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "init video covers %d of %d frames: request at most "
+                     "%d frames", usable, temporal->frame_count, usable);
+        return 0;
+    }
+    float s = sigmas->video[0];
+    for (size_t index = 0; index < video_count; index++)
+        video[index] = (1.0f - s) * latent.values[index] + s * video[index];
+    h3_video_latent_free(&latent);
+    fprintf(stderr, "h3: init video %d frames renoised to video sigma %.6g\n",
+            usable, (double)s);
+
+    char detail[512];
+    float *pcm = NULL;
+    int samples = 0;
+    int max_samples = (int)llround((double)temporal->frame_count * 32000.0 / H3_FPS);
+    if (max_samples > 32000 * 15) max_samples = 32000 * 15;
+    if (!h3_ffmpeg_read_audio_f32(params->init_video, max_samples, 1, &pcm,
+                                  &samples, detail, sizeof(detail))) {
+        free(pcm);
+        fprintf(stderr, "h3: init video has no usable audio, audio starts from noise\n");
+        return 1;
+    }
+    h3_audio_latent alat;
+    memset(&alat, 0, sizeof(alat));
+    int ok = h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", pcm,
+                                 samples, h3_audio_encoder_progress_bridge,
+                                 progress, &alat, detail, sizeof(detail));
+    free(pcm);
+    if (!ok || alat.channels != 32 || alat.stereo != 2 || alat.length < 1) {
+        h3_audio_latent_free(&alat);
+        fprintf(stderr, "h3: init audio could not be encoded, audio starts from noise\n");
+        return 1;
+    }
+    size_t target_t = audio_count / 64;
+    float sa = sigmas->audio[0];
+    size_t copy_t = (size_t)alat.length < target_t ? (size_t)alat.length : target_t;
+    for (size_t row = 0; row < 64; row++)
+        for (size_t time = 0; time < copy_t; time++) {
+            float *dst = &audio[row * target_t + time];
+            *dst = (1.0f - sa) * alat.values[row * (size_t)alat.length + time] +
+                   sa * *dst;
+        }
+    fprintf(stderr, "h3: init audio %d/%zu latent frames renoised to audio sigma %.6g\n",
+            alat.length, target_t, (double)sa);
+    h3_audio_latent_free(&alat);
+    return 1;
+}
+
+/* "--sigmas a,b,c[,0]": an explicit video schedule. The audio stream follows
+ * it through the time shift, as ComfyUI does (t_a = 1 - shift(sigma_v)). */
+static int h3_custom_schedule_build(const char *text, h3_sigma_schedule *schedule) {
+    double video_shift = h3_video_sigma_shift();
+    double audio_shift = h3_audio_sigma_shift();
+    if (!text || video_shift <= 0.0 || audio_shift <= 0.0) return 0;
+    float values[H3_MAX_STEPS + 1];
+    int count = 0;
+    const char *cursor = text;
+    while (*cursor && count <= H3_MAX_STEPS) {
+        char *end = NULL;
+        double value = strtod(cursor, &end);
+        if (end == cursor || value < 0.0 || value > 1.0) return 0;
+        if (count && value >= values[count - 1]) return 0;
+        values[count++] = (float)value;
+        cursor = end;
+        while (*cursor == ',' || *cursor == ' ') cursor++;
+    }
+    if (*cursor || count < 1) return 0;
+    if (values[count - 1] != 0.0f) {
+        if (count > H3_MAX_STEPS) return 0;
+        values[count++] = 0.0f;
+    }
+    if (count < 2) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = count - 1;
+    for (int index = 0; index < count; index++) {
+        schedule->video[index] = values[index];
+        schedule->audio[index] = (float)h3_time_shift_sigma(
+            values[index], video_shift, audio_shift);
+    }
+    schedule->video[count - 1] = 0.0f;
+    schedule->audio[count - 1] = 0.0f;
     return 1;
 }
 
@@ -1665,7 +1811,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (params->custom_sigmas ?
+            !h3_custom_schedule_build(params->custom_sigmas, &sigmas) :
+            !h3_serving_schedule_build(params->steps, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1823,6 +1971,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_rng_seed(&audio_rng, params->seed);
         h3_rng_fill_normal(&video_rng, video, video_count);
         h3_rng_fill_normal(&audio_rng, audio, audio_count);
+        if (params->init_video &&
+            !h3_apply_init_clip(ctx, params, &progress, vae_path,
+                                audio_vae_path, render_width, render_height,
+                                &temporal, latent_w, latent_h, &sigmas,
+                                video, video_count, audio, audio_count))
+            goto cleanup;
     }
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,

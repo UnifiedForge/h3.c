@@ -155,6 +155,12 @@ typedef struct {
      * Ref2VA DiT; may be combined with references. Meant for guide-trained
      * LoRAs (sharpen, character swap _gl, style transfer, VFX edit). */
     const char *guide_video;
+    /* UnifiedForge refine: start the denoise from this clip, encoded on the
+     * target canvas and renoised to the first sigma (Open-H3-Regenerate). */
+    const char *init_video;
+    /* Explicit comma-separated video sigma list ("0.909375,0.857143,
+     * 0.666667,0"); overrides --steps. Audio follows through the time shift. */
+    const char *custom_sigmas;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
