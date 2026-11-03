@@ -161,6 +161,10 @@ typedef struct {
     /* Explicit comma-separated video sigma list ("0.909375,0.857143,
      * 0.666667,0"); overrides --steps. Audio follows through the time shift. */
     const char *custom_sigmas;
+    /* Refine from a latent file instead of a clip (see --save-latent). */
+    const char *init_latent;
+    /* After the denoise, write the final video+audio latent here. */
+    const char *save_latent;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
@@ -210,6 +214,9 @@ h3_ctx *h3_load_dir(const char *model_dir);
 void h3_free(h3_ctx *ctx);
 
 const char *h3_last_error(const h3_ctx *ctx);
+/* UnifiedForge: encode params->init_video at params->width x height and
+ * params->frames into a latent file (no DiT). Returns 0 on error. */
+int h3_encode_latent(h3_ctx *ctx, const h3_params *params, const char *out_path);
 const h3_device_info *h3_device(const h3_ctx *ctx);
 const h3_model_info *h3_model(const h3_ctx *ctx);
 

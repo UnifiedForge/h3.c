@@ -58,6 +58,10 @@ static void usage(const char *program) {
         "                         to the first sigma (with --sigmas)\n"
         "      --sigmas LIST      Explicit video sigmas, e.g. 0.909375,0.857143,\n"
         "                         0.666667,0 (overrides --steps)\n"
+        "      --save-latent PATH Write the final video+audio latent\n"
+        "      --init-latent PATH Refine from a latent file (like --init-video)\n"
+        "      --encode-latent PATH  Only encode --init-video at --width/--height\n"
+        "                         and --frames into a latent file, then exit\n"
         "      --lora PATH[:STRENGTH]  Apply a LoRA adapter (default 1.0,\n"
         "                         repeatable)\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
@@ -287,7 +291,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -340,6 +344,9 @@ int main(int argc, char **argv) {
         {"guide-video", required_argument, NULL, OPT_GUIDE_VIDEO},
         {"init-video", required_argument, NULL, OPT_INIT_VIDEO},
         {"sigmas", required_argument, NULL, OPT_SIGMAS},
+        {"init-latent", required_argument, NULL, OPT_INIT_LATENT},
+        {"save-latent", required_argument, NULL, OPT_SAVE_LATENT},
+        {"encode-latent", required_argument, NULL, OPT_ENCODE_LATENT},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
@@ -352,6 +359,7 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
+    const char *encode_latent_out = NULL;
     h3_reference references[12];
     size_t reference_count = 0;
     /* No static cap on adapters (G4): at most one per argv slot. */
@@ -503,6 +511,9 @@ int main(int argc, char **argv) {
             case OPT_GUIDE_VIDEO: params.guide_video = optarg; break;
             case OPT_INIT_VIDEO: params.init_video = optarg; break;
             case OPT_SIGMAS: params.custom_sigmas = optarg; break;
+            case OPT_INIT_LATENT: params.init_latent = optarg; break;
+            case OPT_SAVE_LATENT: params.save_latent = optarg; break;
+            case OPT_ENCODE_LATENT: encode_latent_out = optarg; break;
             case OPT_LORA: parse_lora(optarg, &loras[lora_count++]); break;
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;
@@ -548,6 +559,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (info) print_info(ctx);
+    if (encode_latent_out) {
+        int ok = h3_encode_latent(ctx, &params, encode_latent_out);
+        if (!ok) fprintf(stderr, "h3: %s\n", h3_last_error(ctx));
+        h3_free(ctx);
+        return ok ? 0 : 1;
+    }
     if (prompt) {
         params.output_path = output;
         params.on_progress = cli_progress;

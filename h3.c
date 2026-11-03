@@ -145,7 +145,7 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
     if (!ref2va && !params->first_frame && !params->last_frame &&
-        !params->guide_video && !params->init_video &&
+        !params->guide_video && !params->init_video && !params->init_latent &&
         !params->custom_sigmas) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
@@ -154,6 +154,7 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
         !h3_key_file(&key, "last", params->last_frame) ||
         !h3_key_file(&key, "guide", params->guide_video) ||
         !h3_key_file(&key, "init", params->init_video) ||
+        !h3_key_file(&key, "initlat", params->init_latent) ||
         !h3_key_append(&key, "|sigmas=%s",
                        params->custom_sigmas ? params->custom_sigmas : "")) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
@@ -513,16 +514,21 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     /* A refine pass (--init-video) redraws an existing clip at a higher
      * resolution with a LoRA trained for it (Open-H3-Regenerate goes to 4K);
      * plain generation keeps the released limit. */
+    int refine = params->init_video || params->init_latent;
+    if (params->init_video && params->init_latent) {
+        h3_set_error(ctx, "use --init-video or --init-latent, not both");
+        return 0;
+    }
     if ((int64_t)params->width * params->height >
-        (params->init_video ? (int64_t)3840 * 2176 : (int64_t)H3_MAX_PIXELS)) {
-        h3_set_error(ctx, params->init_video ?
+        (refine ? (int64_t)3840 * 2176 : (int64_t)H3_MAX_PIXELS)) {
+        h3_set_error(ctx, refine ?
             "refine canvas exceeds 3840*2176" :
             "canvas exceeds the released 768*1344 pixel limit");
         return 0;
     }
     /* First/last-frame anchors stay allowed: on a refine they pin the
      * subject's identity (e.g. a sharp still of the clip's own first frame). */
-    if (params->init_video && (params->reference_count || params->guide_video)) {
+    if (refine && (params->reference_count || params->guide_video)) {
         h3_set_error(ctx, "an init video is a refine pass on the FL2VA DiT: no "
                      "Ref2VA references or guide");
         return 0;
@@ -1046,6 +1052,101 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
     return 1;
 }
 
+/* UnifiedForge latent files: a small safetensors with "video" F32
+ * [24,T,H,W] and optional "audio" F32 [32,2,A] (the engine's own normalized
+ * layouts) plus string metadata. Written after a run (--save-latent) or by
+ * --encode-latent, read by --init-latent. */
+static int h3_write_latent_file(const char *path, const float *video,
+                                int video_t, int latent_h, int latent_w,
+                                const float *audio, int audio_t,
+                                int width, int height, int frames,
+                                char *error, size_t error_size) {
+    size_t vcount = (size_t)24 * video_t * latent_h * latent_w;
+    size_t acount = audio ? (size_t)64 * audio_t : 0;
+    char header[1024];
+    int n = snprintf(header, sizeof(header),
+        "{\"__metadata__\":{\"format\":\"unifiedforge_latent_v1\","
+        "\"width\":\"%d\",\"height\":\"%d\",\"frames\":\"%d\"},"
+        "\"video\":{\"dtype\":\"F32\",\"shape\":[24,%d,%d,%d],"
+        "\"data_offsets\":[0,%zu]}",
+        width, height, frames, video_t, latent_h, latent_w,
+        vcount * sizeof(float));
+    if (audio && n > 0 && (size_t)n < sizeof(header))
+        n += snprintf(header + n, sizeof(header) - (size_t)n,
+            ",\"audio\":{\"dtype\":\"F32\",\"shape\":[32,2,%d],"
+            "\"data_offsets\":[%zu,%zu]}",
+            audio_t, vcount * sizeof(float),
+            (vcount + acount) * sizeof(float));
+    if (n <= 0 || (size_t)n + 9 >= sizeof(header)) {
+        snprintf(error, error_size, "latent header too long");
+        return 0;
+    }
+    header[n++] = '}';
+    while (n % 8) header[n++] = ' ';
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *file = fopen(tmp, "wb");
+    if (!file) {
+        snprintf(error, error_size, "cannot write %s: %s", tmp, strerror(errno));
+        return 0;
+    }
+    uint64_t size = (uint64_t)n;
+    int ok = fwrite(&size, 8, 1, file) == 1 &&
+             fwrite(header, 1, (size_t)n, file) == (size_t)n &&
+             fwrite(video, sizeof(float), vcount, file) == vcount &&
+             (!audio || fwrite(audio, sizeof(float), acount, file) == acount);
+    ok = (fclose(file) == 0) && ok;
+    if (!ok || rename(tmp, path) != 0) {
+        remove(tmp);
+        snprintf(error, error_size, "cannot write latent file %s", path);
+        return 0;
+    }
+    return 1;
+}
+
+/* Read a latent file into the run's buffers: the video must match the
+ * target latent grid exactly; audio is used when its length matches. */
+static int h3_read_latent_file(const char *path, float *video,
+                               size_t video_count, int video_t, int latent_h,
+                               int latent_w, float **audio_out, int *audio_t_out,
+                               char *error, size_t error_size) {
+    h3_st_header header;
+    memset(&header, 0, sizeof(header));
+    *audio_out = NULL;
+    *audio_t_out = 0;
+    if (!h3_st_read_header(path, &header, error, error_size)) return 0;
+    const h3_st_tensor *v = h3_st_find(&header, "video");
+    if (!v || v->dtype != H3_DTYPE_F32 || v->ndim != 4 || v->shape[0] != 24 ||
+        v->shape[1] != (uint64_t)video_t || v->shape[2] != (uint64_t)latent_h ||
+        v->shape[3] != (uint64_t)latent_w) {
+        snprintf(error, error_size,
+                 "%s: video latent must be F32 [24,%d,%d,%d] for this canvas "
+                 "and length", path, video_t, latent_h, latent_w);
+        h3_st_free_header(&header);
+        return 0;
+    }
+    if (!h3_st_read_data(&header, v, video, video_count * sizeof(float),
+                         error, error_size)) {
+        h3_st_free_header(&header);
+        return 0;
+    }
+    const h3_st_tensor *a = h3_st_find(&header, "audio");
+    if (a && a->dtype == H3_DTYPE_F32 && a->ndim == 3 && a->shape[0] == 32 &&
+        a->shape[1] == 2 && a->shape[2] > 0) {
+        size_t count = (size_t)h3_st_tensor_elements(a);
+        float *audio = malloc(count * sizeof(float));
+        if (audio && h3_st_read_data(&header, a, audio, count * sizeof(float),
+                                     error, error_size)) {
+            *audio_out = audio;
+            *audio_t_out = (int)a->shape[2];
+        } else {
+            free(audio);
+        }
+    }
+    h3_st_free_header(&header);
+    return 1;
+}
+
 /* UnifiedForge refine (Open-H3-Regenerate style): replace the pure-noise
  * start with the encoded clip renoised to the first sigma of the schedule,
  * x = (1 - s) * clean + s * noise, per stream. The clip must cover the whole
@@ -1061,6 +1162,43 @@ static int h3_apply_init_clip(h3_ctx *ctx, const h3_params *params,
                               const h3_sigma_schedule *sigmas,
                               float *video, size_t video_count,
                               float *audio, size_t audio_count) {
+    if (params->init_latent) {
+        char detail[512];
+        float *clean = malloc(video_count * sizeof(*clean));
+        float *alat = NULL;
+        int alen = 0;
+        if (!clean) {
+            h3_set_error(ctx, "out of memory reading the init latent");
+            return 0;
+        }
+        if (!h3_read_latent_file(params->init_latent, clean, video_count,
+                                 temporal->video_t, latent_h, latent_w,
+                                 &alat, &alen, detail, sizeof(detail))) {
+            free(clean);
+            h3_set_error(ctx, "%s", detail);
+            return 0;
+        }
+        float s = sigmas->video[0];
+        for (size_t index = 0; index < video_count; index++)
+            video[index] = (1.0f - s) * clean[index] + s * video[index];
+        free(clean);
+        fprintf(stderr, "h3: init latent %s renoised to video sigma %.6g\n",
+                params->init_latent, (double)s);
+        size_t target_t = audio_count / 64;
+        if (alat) {
+            float sa = sigmas->audio[0];
+            size_t copy_t = (size_t)alen < target_t ? (size_t)alen : target_t;
+            for (size_t row = 0; row < 64; row++)
+                for (size_t time = 0; time < copy_t; time++) {
+                    float *dst = &audio[row * target_t + time];
+                    *dst = (1.0f - sa) * alat[row * (size_t)alen + time] + sa * *dst;
+                }
+            fprintf(stderr, "h3: init audio %d/%zu latent frames renoised to "
+                    "audio sigma %.6g\n", alen, target_t, (double)sa);
+            free(alat);
+        }
+        return 1;
+    }
     h3_video_latent latent;
     int usable = 0;
     if (!h3_encode_clip_aligned(ctx, "init video", params->init_video,
@@ -1153,6 +1291,78 @@ static int h3_custom_schedule_build(const char *text, h3_sigma_schedule *schedul
     schedule->video[count - 1] = 0.0f;
     schedule->audio[count - 1] = 0.0f;
     return 1;
+}
+
+/* UnifiedForge: encode a clip (video at the requested canvas and frames,
+ * plus its soundtrack) into a latent file, without loading the DiT. Cheap at
+ * draft size; the latent is then upsampled and refined (H3 Regenerate). */
+int h3_encode_latent(h3_ctx *ctx, const h3_params *params, const char *out_path) {
+    if (!ctx || !params || !params->init_video || !out_path) {
+        h3_set_error(ctx, "encode-latent needs --init-video and an output path");
+        return 0;
+    }
+    if (params->width < 32 || params->height < 32 ||
+        params->width % H3_CANVAS_MULTIPLE || params->height % H3_CANVAS_MULTIPLE) {
+        h3_set_error(ctx, "width and height must be multiples of 32");
+        return 0;
+    }
+    h3_generation_progress progress = {ctx, params, 0};
+    h3_temporal_shape temporal = h3_temporal(params->frames);
+    int latent_w, latent_h;
+    h3_latent_canvas(params->width, params->height, &latent_w, &latent_h);
+    char *vae_path = h3_path(ctx->model_dir, "FL2VA/video_vae/source");
+    char *audio_vae_path = h3_path(ctx->model_dir, "FL2VA/audio_vae");
+    h3_video_latent latent;
+    memset(&latent, 0, sizeof(latent));
+    float *audio = NULL;
+    int audio_t = 0, usable = 0, ok = 0;
+    char detail[512];
+    if (!vae_path || !audio_vae_path) {
+        h3_set_error(ctx, "out of memory resolving model paths");
+        goto done;
+    }
+    if (!h3_encode_clip_aligned(ctx, "init video", params->init_video,
+                                &progress, vae_path, params->width,
+                                params->height, temporal.frame_count,
+                                latent_w, latent_h, &latent, &usable))
+        goto done;
+    {
+        float *pcm = NULL;
+        int samples = 0;
+        int max_samples = (int)llround((double)usable * 32000.0 / H3_FPS);
+        if (max_samples > 32000 * 15) max_samples = 32000 * 15;
+        if (h3_ffmpeg_read_audio_f32(params->init_video, max_samples, 1, &pcm,
+                                     &samples, detail, sizeof(detail))) {
+            h3_audio_latent alat;
+            memset(&alat, 0, sizeof(alat));
+            if (h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", pcm,
+                                    samples, h3_audio_encoder_progress_bridge,
+                                    &progress, &alat, detail, sizeof(detail)) &&
+                alat.channels == 32 && alat.stereo == 2 && alat.length > 0) {
+                audio = alat.values;
+                audio_t = alat.length;
+                alat.values = NULL;
+            }
+            h3_audio_latent_free(&alat);
+        }
+        free(pcm);
+    }
+    if (!h3_write_latent_file(out_path, latent.values, latent.time, latent_h,
+                              latent_w, audio, audio_t, params->width,
+                              params->height, usable, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto done;
+    }
+    fprintf(stderr, "h3: encoded %d frames at %dx%d -> %s (latent %dx%dx%d, audio %d)\n",
+            usable, params->width, params->height, out_path, latent.time,
+            latent_h, latent_w, audio_t);
+    ok = 1;
+done:
+    h3_video_latent_free(&latent);
+    free(audio);
+    free(vae_path);
+    free(audio_vae_path);
+    return ok;
 }
 
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
@@ -1971,7 +2181,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_rng_seed(&audio_rng, params->seed);
         h3_rng_fill_normal(&video_rng, video, video_count);
         h3_rng_fill_normal(&audio_rng, audio, audio_count);
-        if (params->init_video &&
+        if ((params->init_video || params->init_latent) &&
             !h3_apply_init_clip(ctx, params, &progress, vae_path,
                                 audio_vae_path, render_width, render_height,
                                 &temporal, latent_w, latent_h, &sigmas,
@@ -1996,6 +2206,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->save_latent) {
+        if (!h3_write_latent_file(params->save_latent, video, temporal.video_t,
+                                  latent_h, latent_w, audio, temporal.audio_t,
+                                  params->width, params->height,
+                                  temporal.frame_count, detail, sizeof(detail)))
+            fprintf(stderr, "h3: warning: %s\n", detail);
+        else
+            fprintf(stderr, "h3: saved latent %s\n", params->save_latent);
+    }
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
