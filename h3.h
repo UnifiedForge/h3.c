@@ -165,6 +165,8 @@ typedef struct {
     const char *init_latent;
     /* After the denoise, write the final video+audio latent here. */
     const char *save_latent;
+    /* Skip the video VAE decode; output_path receives the soundtrack as WAV. */
+    int skip_video_decode;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \

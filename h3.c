@@ -1052,6 +1052,35 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
     return 1;
 }
 
+static int h3_write_wav16(const char *path, const h3_audio_waveform *wave,
+                          char *error, size_t error_size) {
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        snprintf(error, error_size, "cannot write %s: %s", path, strerror(errno));
+        return 0;
+    }
+    uint32_t channels = (uint32_t)wave->channels, rate = (uint32_t)wave->sample_rate;
+    uint32_t data = (uint32_t)wave->samples * channels * 2;
+    uint32_t riff = 36 + data, fmt_size = 16, byte_rate = rate * channels * 2;
+    uint16_t format = 1, ch16 = (uint16_t)channels, align = (uint16_t)(channels * 2), bits = 16;
+    int ok = fwrite("RIFF", 1, 4, file) == 4 && fwrite(&riff, 4, 1, file) == 1 &&
+             fwrite("WAVEfmt ", 1, 8, file) == 8 && fwrite(&fmt_size, 4, 1, file) == 1 &&
+             fwrite(&format, 2, 1, file) == 1 && fwrite(&ch16, 2, 1, file) == 1 &&
+             fwrite(&rate, 4, 1, file) == 1 && fwrite(&byte_rate, 4, 1, file) == 1 &&
+             fwrite(&align, 2, 1, file) == 1 && fwrite(&bits, 2, 1, file) == 1 &&
+             fwrite("data", 1, 4, file) == 4 && fwrite(&data, 4, 1, file) == 1;
+    for (int sample = 0; ok && sample < wave->samples; sample++)
+        for (int channel = 0; ok && channel < wave->channels; channel++) {
+            float v = wave->pcm[(size_t)channel * (size_t)wave->samples + (size_t)sample];
+            v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+            int16_t pcm16 = (int16_t)lrintf(v * 32767.0f);
+            ok = fwrite(&pcm16, 2, 1, file) == 1;
+        }
+    ok = (fclose(file) == 0) && ok;
+    if (!ok) snprintf(error, error_size, "cannot write WAV %s", path);
+    return ok;
+}
+
 /* UnifiedForge latent files: a small safetensors with "video" F32
  * [24,T,H,W] and optional "audio" F32 [32,2,A] (the engine's own normalized
  * layouts) plus string metadata. Written after a run (--save-latent) or by
@@ -2225,6 +2254,28 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->skip_video_decode) {
+        /* UnifiedForge: the video is decoded outside (fast VAE decoder from
+         * the saved latent); write only the soundtrack, as 16-bit WAV. */
+        if (params->output_path && *params->output_path &&
+            !h3_write_wav16(params->output_path, &waveform, detail,
+                            sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        result = calloc(1, sizeof(*result));
+        if (!result) {
+            h3_set_error(ctx, "out of memory creating generation result");
+            goto cleanup;
+        }
+        result->width = params->width;
+        result->height = params->height;
+        result->frames = temporal.frame_count;
+        result->fps = H3_FPS;
+        result->sample_rate = waveform.sample_rate;
+        result->seed = params->seed;
+        goto cleanup;
+    }
     if (!preview_decoder && ctx->cache_enabled) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
