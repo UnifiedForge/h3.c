@@ -715,6 +715,29 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
     return 1;
 }
 
+/* UnifiedForge: renoise sampler step. The engine's velocity is x0 - noise
+ * (Euler adds (sigma - sigma_next) * v), so the clean estimate is
+ * x0 = x + sigma * v. The next state is x0 at the next noise level with fresh
+ * Gaussian noise; at sigma_next = 0 it is x0 itself. */
+int h3_renoise_step(float *sample, const float *velocity, size_t count,
+                    float sigma, float sigma_next, uint64_t seed) {
+    if (!sample || !velocity || !isfinite(sigma) || !isfinite(sigma_next) ||
+        !(sigma > sigma_next) || sigma_next < 0.0f) return 0;
+    if (sigma_next == 0.0f) {
+        for (size_t index = 0; index < count; index++)
+            sample[index] += sigma * velocity[index];
+        return 1;
+    }
+    h3_rng rng;
+    h3_rng_seed(&rng, seed);
+    float keep = 1.0f - sigma_next;
+    for (size_t index = 0; index < count; index++) {
+        float x0 = sample[index] + sigma * velocity[index];
+        sample[index] = keep * x0 + sigma_next * h3_rng_normal(&rng);
+    }
+    return 1;
+}
+
 int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
                            float sigma, float sigma_next) {
     if (!sample || !velocity || !isfinite(sigma) || !isfinite(sigma_next) ||

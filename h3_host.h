@@ -136,6 +136,9 @@ void h3_rng_seed(h3_rng *rng, uint64_t seed);
 uint32_t h3_rng_u32(h3_rng *rng);
 float h3_rng_normal(h3_rng *rng);
 void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count);
+/* UnifiedForge: one renoise step (see h3_host.c). */
+int h3_renoise_step(float *sample, const float *velocity, size_t count,
+                    float sigma, float sigma_next, uint64_t seed);
 
 /* Resize interleaved RGB24 frames with Accelerate/vImage high-quality
  * resampling. The caller owns *output. Identity geometry still returns an

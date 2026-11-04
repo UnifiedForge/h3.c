@@ -62,6 +62,8 @@ static void usage(const char *program) {
         "      --init-latent PATH Refine from a latent file (like --init-video)\n"
         "      --encode-latent PATH  Only encode --init-video at --width/--height\n"
         "                         and --frames into a latent file, then exit\n"
+        "      --sampler NAME     euler (default) or renoise: x0 re-noised with fresh\n"
+        "                         noise each step (Pika H3 Flex; use with --sigmas)\n"
         "      --no-video-decode  Skip the video VAE decode (use with --save-latent);\n"
         "                         -o receives only the soundtrack as WAV\n"
         "      --lora PATH[:STRENGTH]  Apply a LoRA adapter (default 1.0,\n"
@@ -293,7 +295,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE, OPT_SAMPLER };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -350,6 +352,7 @@ int main(int argc, char **argv) {
         {"save-latent", required_argument, NULL, OPT_SAVE_LATENT},
         {"encode-latent", required_argument, NULL, OPT_ENCODE_LATENT},
         {"no-video-decode", no_argument, NULL, OPT_NO_VIDEO_DECODE},
+        {"sampler", required_argument, NULL, OPT_SAMPLER},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
@@ -518,6 +521,14 @@ int main(int argc, char **argv) {
             case OPT_SAVE_LATENT: params.save_latent = optarg; break;
             case OPT_ENCODE_LATENT: encode_latent_out = optarg; break;
             case OPT_NO_VIDEO_DECODE: params.skip_video_decode = 1; break;
+            case OPT_SAMPLER:
+                if (!strcmp(optarg, "renoise")) params.sampler_renoise = 1;
+                else if (!strcmp(optarg, "euler")) params.sampler_renoise = 0;
+                else {
+                    fprintf(stderr, "h3: --sampler must be euler or renoise\n");
+                    return 2;
+                }
+                break;
             case OPT_LORA: parse_lora(optarg, &loras[lora_count++]); break;
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;

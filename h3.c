@@ -2170,9 +2170,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
          * baked into the model, down to the prompt and the adapters with
          * their strengths; the seed and the two reuse controls are what it
          * does not cover. */
+        char reuse_tag[512];
+        snprintf(reuse_tag, sizeof(reuse_tag), "%s|renoise",
+                 getenv("H3_REUSE_STEPS") ? getenv("H3_REUSE_STEPS") : "");
         resume_key = h3_resume_key(prepared_key, params->seed,
                                    params->denoise_reuse,
-                                   getenv("H3_REUSE_STEPS"));
+                                   params->sampler_renoise ? reuse_tag
+                                                           : getenv("H3_REUSE_STEPS"));
         struct stat resume_status;
         if (!resume_key) {
             h3_set_error(ctx, "out of memory building the resume identity");
@@ -2217,6 +2221,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                 video, video_count, audio, audio_count))
             goto cleanup;
     }
+    h3_dit_set_renoise(dit, params->sampler_renoise, params->seed);
+    if (params->sampler_renoise)
+        fprintf(stderr, "h3: renoise sampler (x0 re-noised each step), %d steps\n",
+                sigmas.steps);
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,

@@ -222,7 +222,16 @@ struct h3_dit {
     char *resume_path;
     char *resume_key;
     const h3_resume_state *resume_from;
+    /* UnifiedForge: renoise sampler (Pika H3 Flex) instead of Euler. */
+    int renoise;
+    uint64_t renoise_seed;
 };
+
+void h3_dit_set_renoise(h3_dit *dit, int enabled, uint64_t seed) {
+    if (!dit) return;
+    dit->renoise = enabled ? 1 : 0;
+    dit->renoise_seed = seed;
+}
 
 int h3_dit_set_resume(h3_dit *dit, const char *path, const char *key,
                       const h3_resume_state *state) {
@@ -3172,7 +3181,7 @@ int h3_dit_denoise_euler_preview(
              dit->core_reuse_interval);
         return 0;
     }
-    if (gpu_sampler_requested(dit)) {
+    if (!dit->renoise && gpu_sampler_requested(dit)) {
         /* The GPU sampler keeps the latents and the whole velocity history in
          * device buffers, the history in BF16. Checkpointing it would mean
          * reading back and rounding exactly the state a resume must restore
@@ -3296,7 +3305,21 @@ int h3_dit_denoise_euler_preview(
                     ? dit->sigmas.audio[previous_evaluated] : 0.0f,
                 previous_evaluated >= 0);
         }
-        if (ok) {
+        if (ok && dit->renoise) {
+            /* fresh noise per step, seeded by run seed and step: a resumed run
+             * draws the same noise as an uninterrupted one */
+            uint64_t s = dit->renoise_seed * 0x9E3779B97F4A7C15ull +
+                         (uint64_t)(step + 1) * 0xBF58476D1CE4E5B9ull;
+            ok = h3_renoise_step(
+                     video_latent, video_velocity, video_count,
+                     dit->sigmas.video[step], dit->sigmas.video[step + 1], s) &&
+                 h3_renoise_step(
+                     audio_latent, audio_velocity, audio_count,
+                     dit->sigmas.audio[step], dit->sigmas.audio[step + 1],
+                     s ^ 0x94D049BB133111EBull);
+            if (!ok) fail(error, error_size,
+                          "renoise sampler rejected step %d", step);
+        } else if (ok) {
             ok = h3_euler_velocity_step(
                      video_latent, video_velocity, video_count,
                      dit->sigmas.video[step], dit->sigmas.video[step + 1]) &&

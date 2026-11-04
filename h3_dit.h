@@ -96,6 +96,8 @@ int h3_dit_reset_run(h3_dit *dit,
  * borrowed, and consumed by the first denoise that follows. Passing a NULL
  * path disarms, which a cached prepared DiT needs between generations.
  * Returns 0 only on allocation failure. */
+/* UnifiedForge: renoise sampler on/off for the next denoise (seed = run seed). */
+void h3_dit_set_renoise(h3_dit *dit, int enabled, uint64_t seed);
 int h3_dit_set_resume(h3_dit *dit, const char *path, const char *key,
                       const h3_resume_state *state);
 

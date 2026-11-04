@@ -167,6 +167,9 @@ typedef struct {
     const char *save_latent;
     /* Skip the video VAE decode; output_path receives the soundtrack as WAV. */
     int skip_video_decode;
+    /* 0 = Euler (default); 1 = renoise: x0 = x + sigma*v, re-noised to the
+     * next sigma with fresh noise (Pika H3 Flex's sampler). */
+    int sampler_renoise;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
