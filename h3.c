@@ -1145,16 +1145,21 @@ static int h3_prepend_history(h3_ctx *ctx, const h3_params *params,
     int samples = 0;
     *history_audio_t = 0;
     *history_audio_offset = 0.0;
-    if (!h3_ffmpeg_read_audio_f32(params->history_video, 32000 * 4, 1, &pcm,
+    detail[0] = '\0';
+    /* The reader needs >= 2 s: the clip's sound runs longer and ENDS at the
+     * end of the hand-over frame; we carry its last (17 + 1) frames. */
+    double carried_units = (double)(clip_frames + 1) / 24.0 * 40.0;
+    if (!h3_ffmpeg_read_audio_f32(params->history_video, 32000 * 8, 1, &pcm,
                                   &samples, detail, sizeof(detail)) ||
-        samples < 800) {
+        samples < (int)(carried_units / 40.0 * 32000.0)) {
+        fprintf(stderr, "h3: history audio: %s\n", detail);
         free(pcm);
         fprintf(stderr, "h3: history video has no usable audio, sound is not carried\n");
         fprintf(stderr, "h3: carried history %d frames -> %d latent frames\n",
                 clip_frames, clip_latents);
         return 1;
     }
-    double units = (double)samples / 32000.0 * 40.0;
+    double units = carried_units;
     int wanted = (int)floor(units + 1e-6);
     int take = wanted * 800;
     float *tail = malloc((size_t)2 * (size_t)take * sizeof(*tail));
