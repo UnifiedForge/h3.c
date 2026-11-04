@@ -155,6 +155,11 @@ typedef struct {
      * Ref2VA DiT; may be combined with references. Meant for guide-trained
      * LoRAs (sharpen, character swap _gl, style transfer, VFX edit). */
     const char *guide_video;
+    /* UnifiedForge extend: carried context. The first 17 frames of this clip
+     * (one VAE clip) and its sound are packed as condition rows placed just
+     * before the target on the rotary clock, so the target continues their
+     * motion and voice. Pair with first_frame = the hand-over frame. FL2VA. */
+    const char *history_video;
     /* UnifiedForge refine: start the denoise from this clip, encoded on the
      * target canvas and renoised to the first sigma (Open-H3-Regenerate). */
     const char *init_video;

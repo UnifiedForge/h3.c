@@ -145,7 +145,8 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
     if (!ref2va && !params->first_frame && !params->last_frame &&
-        !params->guide_video && !params->init_video && !params->init_latent &&
+        !params->guide_video && !params->history_video &&
+        !params->init_video && !params->init_latent &&
         !params->custom_sigmas) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
@@ -153,6 +154,7 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
         !h3_key_file(&key, "first", params->first_frame) ||
         !h3_key_file(&key, "last", params->last_frame) ||
         !h3_key_file(&key, "guide", params->guide_video) ||
+        !h3_key_file(&key, "history", params->history_video) ||
         !h3_key_file(&key, "init", params->init_video) ||
         !h3_key_file(&key, "initlat", params->init_latent) ||
         !h3_key_append(&key, "|sigmas=%s",
@@ -638,6 +640,12 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "a guide video cannot be combined with frame anchors");
         return 0;
     }
+    if (params->history_video && (params->reference_count || params->guide_video ||
+                                  params->init_video || params->init_latent)) {
+        h3_set_error(ctx, "carried history (--history-video) runs on FL2VA only: "
+                          "no references, guide or init");
+        return 0;
+    }
     size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
@@ -1052,6 +1060,143 @@ static int h3_prepend_guide(h3_ctx *ctx, const h3_params *params,
     return 1;
 }
 
+/* UnifiedForge extend: encode the carried context (see h3.h history_video)
+ * and prepend its video rows to the condition rows (history comes first,
+ * before the frame anchors); its sound becomes the clean condition audio
+ * rows (FL2VA has no other audio conditions). */
+static int h3_prepend_history(h3_ctx *ctx, const h3_params *params,
+                              h3_generation_progress *progress,
+                              const char *vae_path, const char *audio_vae_path,
+                              int render_width, int render_height,
+                              int latent_w, int latent_h,
+                              float **rows_io, size_t *elements_io,
+                              float **audio_io, size_t *audio_elements_io,
+                              int *history_latent_t, int *history_audio_t,
+                              double *history_audio_offset) {
+    const int clip_frames = 17, clip_latents = 5;
+    char detail[512];
+    float *pixels = NULL;
+    int frames = 0;
+    if (!h3_ffmpeg_read_video_f32(params->history_video, render_width,
+                                  render_height, clip_frames, &pixels, &frames,
+                                  detail, sizeof(detail))) {
+        h3_set_error(ctx, "history video: %s", detail);
+        return 0;
+    }
+    if (frames < clip_frames) {
+        free(pixels);
+        h3_set_error(ctx, "history video needs %d frames, has %d",
+                     clip_frames, frames);
+        return 0;
+    }
+    h3_video_latent latent;
+    memset(&latent, 0, sizeof(latent));
+    if (!h3_video_vae_encode(vae_path, "h3_shaders.metal", pixels, clip_frames,
+                             render_height, render_width,
+                             h3_video_encoder_progress_bridge, progress,
+                             &latent, detail, sizeof(detail))) {
+        free(pixels);
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "history video: %s", detail);
+        return 0;
+    }
+    free(pixels);
+    if (latent.time != clip_latents || latent.height != latent_h ||
+        latent.width != latent_w) {
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "history video VAE produced unexpected latent geometry");
+        return 0;
+    }
+    size_t span = (size_t)clip_latents * (size_t)latent_h * (size_t)latent_w / 4 * 96;
+    float *combined = malloc((span + *elements_io) * sizeof(*combined));
+    if (!combined) {
+        h3_video_latent_free(&latent);
+        h3_set_error(ctx, "out of memory packing the history video");
+        return 0;
+    }
+    if (!h3_dit_patchify_video(latent.values, 24, clip_latents, latent_h,
+                               latent_w, combined, span)) {
+        h3_video_latent_free(&latent);
+        free(combined);
+        h3_set_error(ctx, "cannot patchify the history latent");
+        return 0;
+    }
+    h3_video_latent_free(&latent);
+    h3_augment_span(combined, span, params->seed);
+    if (*elements_io)
+        memcpy(combined + span, *rows_io, *elements_io * sizeof(*combined));
+    free(*rows_io);
+    *rows_io = combined;
+    *elements_io += span;
+    *history_latent_t = clip_latents;
+
+    /* Carried sound: whole 1/40 s latents ending where the picture hands
+     * over; the fractional remainder shifts their start on the clock. */
+    float *pcm = NULL;
+    int samples = 0;
+    *history_audio_t = 0;
+    *history_audio_offset = 0.0;
+    if (!h3_ffmpeg_read_audio_f32(params->history_video, 32000 * 4, 1, &pcm,
+                                  &samples, detail, sizeof(detail)) ||
+        samples < 800) {
+        free(pcm);
+        fprintf(stderr, "h3: history video has no usable audio, sound is not carried\n");
+        fprintf(stderr, "h3: carried history %d frames -> %d latent frames\n",
+                clip_frames, clip_latents);
+        return 1;
+    }
+    double units = (double)samples / 32000.0 * 40.0;
+    int wanted = (int)floor(units + 1e-6);
+    int take = wanted * 800;
+    float *tail = malloc((size_t)2 * (size_t)take * sizeof(*tail));
+    if (!tail) {
+        free(pcm);
+        h3_set_error(ctx, "out of memory reading the history audio");
+        return 0;
+    }
+    for (int channel = 0; channel < 2; channel++)
+        memcpy(tail + (size_t)channel * take,
+               pcm + (size_t)channel * samples + (size_t)(samples - take),
+               (size_t)take * sizeof(*tail));
+    free(pcm);
+    h3_audio_latent alat;
+    memset(&alat, 0, sizeof(alat));
+    int ok = h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", tail, take,
+                                 h3_audio_encoder_progress_bridge, progress,
+                                 &alat, detail, sizeof(detail));
+    free(tail);
+    if (!ok || alat.channels != 32 || alat.stereo != 2 || alat.length < 1) {
+        h3_audio_latent_free(&alat);
+        fprintf(stderr, "h3: history audio could not be encoded, sound is not carried\n");
+        return 1;
+    }
+    int count = alat.length < wanted ? alat.length : wanted;
+    size_t elements = (size_t)count * 2 * 32;
+    float *grown = realloc(*audio_io,
+                           (*audio_elements_io + elements) * sizeof(*grown));
+    if (!grown) {
+        h3_audio_latent_free(&alat);
+        h3_set_error(ctx, "out of memory packing the history audio");
+        return 0;
+    }
+    *audio_io = grown;
+    float *rows = grown + *audio_elements_io;
+    for (int stereo = 0; stereo < 2; stereo++)
+        for (int time = 0; time < count; time++)
+            for (int channel = 0; channel < 32; channel++)
+                rows[((size_t)stereo * count + (size_t)time) * 32 + (size_t)channel] =
+                    alat.values[((size_t)channel * 2 + (size_t)stereo) *
+                                alat.length + (size_t)time];
+    *audio_elements_io += elements;
+    *history_audio_t = count;
+    *history_audio_offset = units - wanted;
+    h3_audio_latent_free(&alat);
+    fprintf(stderr, "h3: carried history %d frames -> %d latent frames, "
+                    "sound %d latents (offset %.3f)\n",
+            clip_frames, clip_latents, count, *history_audio_offset);
+    return 1;
+}
+
 static int h3_write_wav16(const char *path, const h3_audio_waveform *wave,
                           char *error, size_t error_size) {
     FILE *file = fopen(path, "wb");
@@ -1449,6 +1594,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     float *condition_video_rows = NULL;
     size_t condition_video_elements = 0;
     int guide_latent_t = 0;
+    int history_latent_t = 0, history_audio_t = 0;
+    double history_audio_offset = 0.0;
     float *condition_audio_rows = NULL;
     size_t condition_audio_elements = 0;
     h3_text_embedding text;
@@ -2037,6 +2184,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                               &guide_latent_t)) goto cleanup;
         conditioned = 1;
     }
+    if (params->history_video) {
+        if (!h3_prepend_history(ctx, params, &progress, vae_path, audio_vae_path,
+                                render_width, render_height, latent_w, latent_h,
+                                &condition_video_rows, &condition_video_elements,
+                                &condition_audio_rows, &condition_audio_elements,
+                                &history_latent_t, &history_audio_t,
+                                &history_audio_offset)) goto cleanup;
+        conditioned = 1;
+    }
     if (progress.cancelled) goto cleanup;
 
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
@@ -2044,7 +2200,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                            keyframes, keyframe_count,
                            layout_references,
                            ref2va ? params->reference_count : 0,
-                           guide_latent_t};
+                           guide_latent_t, history_latent_t,
+                           history_audio_t, history_audio_offset};
     if (!h3_layout_build(&spec, &layout, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;

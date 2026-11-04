@@ -68,6 +68,13 @@ typedef struct {
     /* Latent frames of an aligned guide clip anchored at target frame 0, or
      * 0 for none. Its rows come first, before any references. */
     int guide_latent_t;
+    /* UnifiedForge extend: carried history latent frames placed BEFORE the
+     * target on the clock (the target origin moves later by their span), and
+     * carried audio latents starting history_audio_offset rotary units after
+     * the history video. 0 = none. */
+    int history_latent_t;
+    int history_audio_t;
+    double history_audio_offset;
 } h3_layout_spec;
 
 typedef struct {

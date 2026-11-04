@@ -399,6 +399,26 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     free(text);
 
     double cursor = (double)spec->text_len;
+    /* UnifiedForge extend: history rows first, at the media origin; the
+     * target (and its frame anchors) starts one history span later. */
+    double target_origin = (double)spec->text_len;
+    if (spec->history_latent_t > 0) {
+        if (spec->guide_latent_t > 0 || spec->reference_count) {
+            h3_builder_fail(&builder, "carried history cannot be combined with a guide or references");
+            goto fail;
+        }
+        size_t history_rows = 0;
+        h3_position *history = h3_video_grid((double)spec->text_len,
+                                             spec->history_latent_t,
+                                             frame, frame_rows, &history_rows);
+        if (!history) goto oom;
+        int ok = h3_emit(&builder, H3_SEG_COND, history, history_rows);
+        free(history);
+        if (!ok) goto fail;
+        layout->img_cond_rows += history_rows;
+        target_origin += h3_video_span_sum(spec->history_latent_t);
+        cursor = target_origin;
+    }
     if (spec->guide_latent_t > 0) {
         if (spec->keyframe_count) {
             h3_builder_fail(&builder, "a guide clip cannot be combined with frame anchors");
@@ -427,9 +447,9 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     for (size_t index = 0; index < spec->keyframe_count; index++) {
         double condition_time;
         if (spec->keyframes[index] == 0) {
-            condition_time = (double)spec->text_len;
+            condition_time = target_origin;
         } else if (spec->keyframes[index] == spec->frame_count - 1) {
-            condition_time = (double)spec->text_len +
+            condition_time = target_origin +
                              h3_video_span_sum(spec->latent_t) - h3_frame_rescale;
         } else {
             h3_builder_fail(&builder, "only first and last keyframes are valid");
@@ -438,6 +458,17 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
         for (size_t row = 0; row < frame_rows; row++) frame[row].t = condition_time;
         if (!h3_emit(&builder, H3_SEG_COND, frame, frame_rows)) goto fail;
         layout->img_cond_rows += frame_rows;
+    }
+    if (spec->history_audio_t > 0) {
+        size_t rows = 0;
+        h3_position *carried = h3_audio_grid(
+            (double)spec->text_len + spec->history_audio_offset,
+            spec->history_audio_t, w_axis[0], w_axis[w_count - 1], &rows);
+        if (!carried) goto oom;
+        int ok = h3_emit(&builder, H3_SEG_REF_AUDIO, carried, rows);
+        free(carried);
+        if (!ok) goto fail;
+        layout->audio_cond_rows += rows;
     }
 
     for (size_t index = 0; index < spec->reference_count; index++) {

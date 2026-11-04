@@ -52,6 +52,9 @@ static void usage(const char *program) {
         "      --resume PATH      Checkpoint the denoise to PATH after every\n"
         "                         evaluation and continue from it if it holds\n"
         "                         this same run (delete it to start over)\n"
+        "      --history-video PATH Carried context for extend: first 17 frames +\n"
+        "                         their sound, placed before the target (FL2VA; pair\n"
+        "                         with --first-frame = the hand-over frame)\n"
         "      --guide-video PATH Aligned source-video guide on the Ref2VA DiT\n"
         "                         (for guide-trained LoRAs)\n"
         "      --init-video PATH  Refine pass: start from this clip renoised\n"
@@ -295,7 +298,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE, OPT_SAMPLER };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE, OPT_SAMPLER, OPT_HISTORY_VIDEO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -346,6 +349,7 @@ int main(int argc, char **argv) {
         {"lora", required_argument, NULL, OPT_LORA},
         {"resume", required_argument, NULL, OPT_RESUME},
         {"guide-video", required_argument, NULL, OPT_GUIDE_VIDEO},
+        {"history-video", required_argument, NULL, OPT_HISTORY_VIDEO},
         {"init-video", required_argument, NULL, OPT_INIT_VIDEO},
         {"sigmas", required_argument, NULL, OPT_SIGMAS},
         {"init-latent", required_argument, NULL, OPT_INIT_LATENT},
@@ -515,6 +519,7 @@ int main(int argc, char **argv) {
             }
             case OPT_RESUME: params.resume_path = optarg; break;
             case OPT_GUIDE_VIDEO: params.guide_video = optarg; break;
+            case OPT_HISTORY_VIDEO: params.history_video = optarg; break;
             case OPT_INIT_VIDEO: params.init_video = optarg; break;
             case OPT_SIGMAS: params.custom_sigmas = optarg; break;
             case OPT_INIT_LATENT: params.init_latent = optarg; break;
