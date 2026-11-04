@@ -1077,17 +1077,26 @@ static int h3_prepend_history(h3_ctx *ctx, const h3_params *params,
     char detail[512];
     float *pixels = NULL;
     int frames = 0;
+    /* The shared reader keeps 17n+5 frames: the clip carries 22 (17 history
+     * + the hand-over frame + padding); repack the first 17 channel-major. */
     if (!h3_ffmpeg_read_video_f32(params->history_video, render_width,
-                                  render_height, clip_frames, &pixels, &frames,
+                                  render_height, 22, &pixels, &frames,
                                   detail, sizeof(detail))) {
         h3_set_error(ctx, "history video: %s", detail);
         return 0;
     }
-    if (frames < clip_frames) {
+    if (frames < 22) {
         free(pixels);
-        h3_set_error(ctx, "history video needs %d frames, has %d",
-                     clip_frames, frames);
+        h3_set_error(ctx, "history video needs 22 frames (17 history + hand-over "
+                          "+ padding), has %d", frames);
         return 0;
+    }
+    {
+        size_t area = (size_t)render_width * (size_t)render_height;
+        for (int channel = 1; channel < 3; channel++)
+            memmove(pixels + (size_t)channel * clip_frames * area,
+                    pixels + (size_t)channel * frames * area,
+                    (size_t)clip_frames * area * sizeof(*pixels));
     }
     h3_video_latent latent;
     memset(&latent, 0, sizeof(latent));
