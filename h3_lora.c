@@ -183,18 +183,37 @@ static int h3_lora_read_alpha(const h3_st_header *header, const char *key,
 int h3_lora_parse_argument(char *argument, h3_lora *lora, const char **tail) {
     lora->path = argument;
     lora->strength = 1.0f;
+    lora->from_sigma = 0.0f;
     char *colon = strrchr(argument, ':');
     if (!colon) return 1;
     if (tail) *tail = colon + 1;
     char *end = NULL;
     errno = 0;
     float strength = strtof(colon + 1, &end);
-    if (errno || !end || end == colon + 1 || *end || !isfinite(strength)) {
+    if (errno || !end || end == colon + 1 || !isfinite(strength)) {
+        return 0;
+    }
+    float from_sigma = 0.0f;
+    if (*end == '@') {   /* UnifiedForge: STRENGTH@SIGMA — active only at sigma <= SIGMA */
+        char *gate = end + 1;
+        errno = 0;
+        from_sigma = strtof(gate, &end);
+        if (errno || end == gate || *end || !isfinite(from_sigma) ||
+            from_sigma <= 0.0f || from_sigma > 1.0f) return 0;
+    } else if (*end) {
         return 0;
     }
     *colon = '\0';
     lora->strength = strength;
+    lora->from_sigma = from_sigma;
     return 1;
+}
+
+/* UnifiedForge: time-gated LoRA — the step sigma the dispatch compares with. */
+static float h3_lora_step_sigma = -1.0f;
+
+void h3_lora_set_step_sigma(float sigma) {
+    h3_lora_step_sigma = sigma;
 }
 
 /* ---- parse ---- */
@@ -793,6 +812,14 @@ int h3_lora_set_build(h3_ctx *ctx, const h3_params *params,
         }
         set->entries[set->count].adapter = adapter;
         set->entries[set->count].strength = request->strength;
+        set->entries[set->count].from_sigma = request->from_sigma;
+        if (request->from_sigma > 0.0f) {
+            h3_lora_line(params->on_report, params->callback_opaque,
+                         "%s: active from sigma %.3g (late steps only)%s",
+                         request->path, (double)request->from_sigma,
+                         adapter->adaln_pair_count ?
+                         "; its AdaLN pairs stay on every step" : "");
+        }
         set->count++;
     }
     return 1;
@@ -912,6 +939,7 @@ static int h3_lora_branch_build(const h3_lora_entry *entry,
         branch->a = h3_gpu_tensor_from_bf16(gpu, a, a_count);
         branch->b = h3_gpu_tensor_from_bf16(gpu, b, b_count);
         branch->rank = (uint32_t)pair->rank;
+        branch->from_sigma = entry->from_sigma;
         if (!branch->a || !branch->b) {
             snprintf(error, error_size, "cannot upload LoRA %s: %s",
                      pair->name, h3_gpu_error(gpu));
@@ -996,6 +1024,8 @@ int h3_lora_dispatch_branch(h3_gpu *gpu, const h3_lora_site *site,
                             char *error, size_t error_size) {
     for (unsigned index = 0; index < site->count; index++) {
         const h3_lora_branch *branch = &site->branches[index];
+        if (branch->from_sigma > 0.0f && h3_lora_step_sigma >= 0.0f &&
+            h3_lora_step_sigma > branch->from_sigma + 1e-6f) continue;
         if (!h3_gpu_linear_bf16(gpu, hidden, x, branch->a, NULL, rows,
                                 input_dim, branch->rank)) {
             if (error && error_size)

@@ -205,8 +205,9 @@ static char *h3_prepared_key(const char *conditioning,
      * precompute. Order is significant and never sorted. */
     for (size_t index = 0; index < loras->count; index++) {
         if (!h3_key_file(&key, "lora", loras->entries[index].adapter->path) ||
-            !h3_key_append(&key, "|strength=%.9g",
-                           (double)loras->entries[index].strength)) {
+            !h3_key_append(&key, "|strength=%.9g|from=%.6g",
+                           (double)loras->entries[index].strength,
+                           (double)loras->entries[index].from_sigma)) {
             free(key.text);
             return NULL;
         }

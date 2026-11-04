@@ -50,6 +50,7 @@ typedef struct h3_lora_adapter {
 typedef struct {
     const h3_lora_adapter *adapter;
     float strength;
+    float from_sigma;   /* UnifiedForge: 0 = every step */
 } h3_lora_entry;
 
 typedef struct {
@@ -92,7 +93,12 @@ typedef struct {
     h3_gpu_tensor *a;   /* [rank, in]  */
     h3_gpu_tensor *b;   /* [out, rank] */
     uint32_t rank;
+    float from_sigma;   /* UnifiedForge: skipped while the step sigma is above */
 } h3_lora_branch;
+
+/* UnifiedForge: the video sigma of the step being encoded (set by the DiT
+ * before each forward; < 0 outside the denoise = every branch active). */
+void h3_lora_set_step_sigma(float sigma);
 
 /* Every branch that targets one base weight, in active-set order: N adapters
  * are N sequential branches, never a concatenated A or block-diagonal B. */

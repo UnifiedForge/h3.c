@@ -2332,6 +2332,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
     if (begin) OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
+    /* UnifiedForge: time-gated LoRA branches read this while encoding. */
+    h3_lora_set_step_sigma(dit->sigmas.video[step]);
     size_t video_offset = 0;
     size_t audio_offset = 0;
     if (dit->fused_patch_pack) {

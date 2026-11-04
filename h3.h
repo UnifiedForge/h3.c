@@ -63,6 +63,9 @@ typedef struct {
 typedef struct {
     const char *path;
     float strength;
+    /* UnifiedForge: 0 = every step; otherwise the adapter acts only on steps
+     * whose video sigma <= from_sigma (`--lora PATH:STRENGTH@SIGMA`). */
+    float from_sigma;
 } h3_lora;
 
 typedef int (*h3_frame_callback)(const h3_frame *frame, void *opaque);
