@@ -531,9 +531,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     /* First/last-frame anchors stay allowed: on a refine they pin the
      * subject's identity (e.g. a sharp still of the clip's own first frame). */
-    if (refine && (params->reference_count || params->guide_video)) {
-        h3_set_error(ctx, "an init video is a refine pass on the FL2VA DiT: no "
-                     "Ref2VA references or guide");
+    /* UnifiedForge 2026-11-05: references are allowed (Ref2VA refine — the
+     * photos pin identity); a guide is not (it owns the target timeline). */
+    if (refine && params->guide_video) {
+        h3_set_error(ctx, "an init video is a refine pass: no guide video");
         return 0;
     }
     if ((params->render_width == 0) != (params->render_height == 0)) {
