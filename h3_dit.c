@@ -186,6 +186,10 @@ struct h3_dit {
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *activated;
     h3_gpu_tensor *mlp_output;
+    /* UnifiedForge: row-chunk scratch for the MLP (see run_block) */
+    h3_gpu_tensor *mlp_chunk_in;
+    h3_gpu_tensor *mlp_chunk_out;
+    uint32_t mlp_chunk_rows;
     h3_gpu_tensor *int8_activation;
     h3_gpu_tensor *int8_activation_scales;
     h3_gpu_tensor *final_audio_input;
@@ -2206,7 +2210,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                          dit->attention_heads, rows, INNER, HIDDEN,
                          error, error_size)) return 0;
     }
-    int fused_int8_mlp_input = dit->int8_mlp &&
+    /* UnifiedForge: rows × FFN×2 past 2^31 → the MLP runs in row chunks (32-bit kernel indexing) */
+    int mlp_chunked = (uint64_t)rows * FFN * 2 > 0x7fffffffull;
+    int fused_int8_mlp_input = !mlp_chunked && dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
         !getenv("H3_INT8_MLP_STAGE");
@@ -2236,59 +2242,93 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
-        (weight->lora_fc1.count || weight->lora_fc2.count)) {
-        OP(h3_gpu_linear_int8_bf16(
-            dit->gpu, dit->fc1, dit->int8_activation,
-            dit->int8_activation_scales, dit->mod_mlp,
-            weight->fc1_int8, weight->fc1_scales, rows, HIDDEN, FFN * 2,
-            dit->use_slower_uncached_int8_scales),
-           "DiT int8 MLP input (LoRA)");
-        if (!lora_branch_probe(dit, &weight->lora_fc1, dit->fc1, dit->mod_mlp, rows,
-                         HIDDEN, FFN * 2, "int8 fc1", error, error_size)) return 0;
-        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
-           "DiT SwiGLU (LoRA)");
-        OP(h3_gpu_linear_int8_bf16(
-            dit->gpu, mlp_output, dit->int8_activation,
-            dit->int8_activation_scales, dit->activated,
-            weight->fc2_int8, weight->fc2_scales, rows, FFN, HIDDEN,
-            dit->use_slower_uncached_int8_scales),
-           "DiT int8 MLP output (LoRA)");
-        if (!lora_branch_probe(dit, &weight->lora_fc2, mlp_output, dit->activated,
-                         rows, FFN, HIDDEN, "int8 fc2", error, error_size)) return 0;
-    } else if (dit->int8_mlp &&
-        (!getenv("H3_DISABLE_INT8_MLP") ||
-         !weight->fc1 || !weight->fc2)) {
-        OP(h3_gpu_mlp_int8_bf16(
-            dit->gpu, mlp_output, dit->activated, dit->int8_activation,
-            dit->int8_activation_scales, dit->mod_mlp,
-            weight->fc1_int8, weight->fc1_scales,
-            weight->fc2_int8, weight->fc2_scales,
-            weight->fc1, weight->fc2,
-            rows, HIDDEN, FFN, HIDDEN,
-            dit->use_slower_grouped_quantizer,
-            dit->use_slower_dynamic_fc1_k, dit->use_int8_row_fc2,
-            fused_int8_mlp_input),
-           "DiT int8 fused MLP");
-    } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
-        OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
-            dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
-            HIDDEN), "DiT NAX fused MLP");
-    } else if (dit->fused_mlp) {
-        OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
-            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
-           "DiT fused MLP");
-    } else {
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
-            NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
-        if (!lora_branch(dit, &weight->lora_fc1, dit->fc1, dit->mod_mlp, rows,
-                         HIDDEN, FFN * 2, error, error_size)) return 0;
-        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
-           "DiT SwiGLU");
-        OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
-            weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
-        if (!lora_branch(dit, &weight->lora_fc2, mlp_output, dit->activated,
-                         rows, FFN, HIDDEN, error, error_size)) return 0;
+    uint32_t mlp_step = rows;
+    if (mlp_chunked) {
+        mlp_step = (uint32_t)(0x7fffffffull / ((uint64_t)FFN * 2)) & ~127u;
+        if (!dit->mlp_chunk_in || dit->mlp_chunk_rows < mlp_step) {
+            h3_gpu_tensor_free(dit->mlp_chunk_in);
+            h3_gpu_tensor_free(dit->mlp_chunk_out);
+            dit->mlp_chunk_in = h3_gpu_tensor_new_bf16(dit->gpu, (size_t)mlp_step * HIDDEN);
+            dit->mlp_chunk_out = h3_gpu_tensor_new_bf16(dit->gpu, (size_t)mlp_step * HIDDEN);
+            dit->mlp_chunk_rows = mlp_step;
+            if (!dit->mlp_chunk_in || !dit->mlp_chunk_out) {
+                fail(error, error_size, "cannot allocate MLP row-chunk scratch: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+            fprintf(stderr, "h3: MLP in %u-row chunks (UnifiedForge 32-bit index fix, %u rows)\n",
+                    mlp_step, rows);
+        }
+    }
+    for (uint32_t mlp_start = 0; mlp_start < rows; mlp_start += mlp_step) {
+        uint32_t mlp_rows = rows - mlp_start < mlp_step ? rows - mlp_start : mlp_step;
+        h3_gpu_tensor *mlp_in = dit->mod_mlp;
+        h3_gpu_tensor *mlp_out = mlp_output;
+        if (mlp_chunked) {
+            OP(h3_gpu_copy_bf16(dit->gpu, dit->mlp_chunk_in, 0, dit->mod_mlp,
+                                (size_t)mlp_start * HIDDEN, (size_t)mlp_rows * HIDDEN),
+               "DiT MLP chunk input");
+            mlp_in = dit->mlp_chunk_in;
+            mlp_out = dit->mlp_chunk_out;
+        }
+        if (dit->int8_mlp &&
+            (weight->lora_fc1.count || weight->lora_fc2.count)) {
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, dit->fc1, dit->int8_activation,
+                dit->int8_activation_scales, mlp_in,
+                weight->fc1_int8, weight->fc1_scales, mlp_rows, HIDDEN, FFN * 2,
+                dit->use_slower_uncached_int8_scales),
+               "DiT int8 MLP input (LoRA)");
+            if (!lora_branch_probe(dit, &weight->lora_fc1, dit->fc1, mlp_in, mlp_rows,
+                             HIDDEN, FFN * 2, "int8 fc1", error, error_size)) return 0;
+            OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, mlp_rows, FFN),
+               "DiT SwiGLU (LoRA)");
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, mlp_out, dit->int8_activation,
+                dit->int8_activation_scales, dit->activated,
+                weight->fc2_int8, weight->fc2_scales, mlp_rows, FFN, HIDDEN,
+                dit->use_slower_uncached_int8_scales),
+               "DiT int8 MLP output (LoRA)");
+            if (!lora_branch_probe(dit, &weight->lora_fc2, mlp_out, dit->activated,
+                             mlp_rows, FFN, HIDDEN, "int8 fc2", error, error_size)) return 0;
+        } else if (dit->int8_mlp &&
+            (!getenv("H3_DISABLE_INT8_MLP") ||
+             !weight->fc1 || !weight->fc2)) {
+            OP(h3_gpu_mlp_int8_bf16(
+                dit->gpu, mlp_out, dit->activated, dit->int8_activation,
+                dit->int8_activation_scales, mlp_in,
+                weight->fc1_int8, weight->fc1_scales,
+                weight->fc2_int8, weight->fc2_scales,
+                weight->fc1, weight->fc2,
+                mlp_rows, HIDDEN, FFN, HIDDEN,
+                dit->use_slower_grouped_quantizer,
+                dit->use_slower_dynamic_fc1_k, dit->use_int8_row_fc2,
+                fused_int8_mlp_input),
+               "DiT int8 fused MLP");
+        } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
+            OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_out, dit->activated,
+                mlp_in, weight->fc1, weight->fc2, mlp_rows, HIDDEN, FFN,
+                HIDDEN), "DiT NAX fused MLP");
+        } else if (dit->fused_mlp) {
+            OP(h3_gpu_mlp_bf16(dit->gpu, mlp_out, mlp_in,
+                weight->fc1, weight->fc2, mlp_rows, HIDDEN, FFN, HIDDEN),
+               "DiT fused MLP");
+        } else {
+            OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, mlp_in, weight->fc1,
+                NULL, mlp_rows, HIDDEN, FFN * 2), "DiT MLP input");
+            if (!lora_branch(dit, &weight->lora_fc1, dit->fc1, mlp_in, mlp_rows,
+                             HIDDEN, FFN * 2, error, error_size)) return 0;
+            OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, mlp_rows, FFN),
+               "DiT SwiGLU");
+            OP(h3_gpu_linear_bf16(dit->gpu, mlp_out, dit->activated,
+                weight->fc2, NULL, mlp_rows, FFN, HIDDEN), "DiT MLP output");
+            if (!lora_branch(dit, &weight->lora_fc2, mlp_out, dit->activated,
+                             mlp_rows, FFN, HIDDEN, error, error_size)) return 0;
+        }
+        if (mlp_chunked)
+            OP(h3_gpu_copy_bf16(dit->gpu, mlp_output, (size_t)mlp_start * HIDDEN,
+                                dit->mlp_chunk_out, 0, (size_t)mlp_rows * HIDDEN),
+               "DiT MLP chunk output");
     }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
@@ -3428,7 +3468,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
-    FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
+    FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1); FREE(mlp_chunk_in); FREE(mlp_chunk_out);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
     FREE(int8_activation_scales); FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_inverse);
