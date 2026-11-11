@@ -22,6 +22,22 @@ int h3_multimodal_encode_fl2va_bf16(
                         h3_text_embedding *output,
                         char *error, size_t error_size);
 
+/* h3image: the MiniMax-H3-Image edit presentation: a `Picture i: ` label
+ * (no angle brackets) and one vision block per reference, then the prompt
+ * verbatim, truncated to max_prompt_tokens (0 = no limit). When ids_out is
+ * set the caller receives the presentation token ids and frees them with
+ * free(). */
+int h3_multimodal_encode_image_edit_bf16(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt, size_t max_prompt_tokens,
+                        const h3_vision_output *images, size_t image_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        uint32_t **ids_out, size_t *id_count_out,
+                        char *error, size_t error_size);
+
 typedef enum {
     H3_PRESENTATION_IMAGE = 1,
     H3_PRESENTATION_VIDEO = 2,

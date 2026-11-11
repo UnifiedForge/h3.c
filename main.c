@@ -67,8 +67,9 @@ static void usage(const char *program) {
         "                         and --frames into a latent file, then exit\n"
         "      --sampler NAME     euler (default) or renoise: x0 re-noised with fresh\n"
         "                         noise each step (Pika H3 Flex; use with --sigmas)\n"
-        "      --image-model DIR  MiniMax-H3-Image text-to-image (6 steps); writes\n"
-        "                         the image latent to --save-latent\n"
+        "      --image-model DIR  MiniMax-H3-Image (6 steps): text-to-image, or\n"
+        "                         editing with up to 16 --ref-image (Picture 1..N in\n"
+        "                         order); writes the image latent to --save-latent\n"
         "      --noise-file PATH  Image: start from this raw F32 noise latent\n"
         "      --no-video-decode  Skip the video VAE decode (use with --save-latent);\n"
         "                         -o receives only the soundtrack as WAV\n"
@@ -143,10 +144,15 @@ static void parse_lora(char *argument, h3_lora *lora) {
     }
 }
 
-static h3_reference *append_reference(h3_reference references[12],
-                                      size_t *count) {
-    if (*count >= 12) {
-        fprintf(stderr, "h3: Ref2VA supports at most 12 references\n");
+/* h3image: the image model edits with up to 16 references; Ref2VA keeps its
+ * limit of 12, checked once the whole command line is known. */
+#define H3_CLI_MAX_REFERENCES 16
+
+static h3_reference *append_reference(
+        h3_reference references[H3_CLI_MAX_REFERENCES], size_t *count) {
+    if (*count >= H3_CLI_MAX_REFERENCES) {
+        fprintf(stderr, "h3: at most %d references (12 for Ref2VA)\n",
+                H3_CLI_MAX_REFERENCES);
         exit(2);
     }
     h3_reference *reference = &references[(*count)++];
@@ -377,7 +383,7 @@ int main(int argc, char **argv) {
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
     const char *encode_latent_out = NULL;
-    h3_reference references[12];
+    h3_reference references[H3_CLI_MAX_REFERENCES];
     size_t reference_count = 0;
     /* No static cap on adapters (G4): at most one per argv slot. */
     h3_lora *loras = calloc((size_t)argc, sizeof(*loras));
@@ -570,6 +576,10 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "h3: warning: --reuse with only %d denoising steps leaves very "
             "few fresh model evaluations\n", params.steps);
+    }
+    if (!params.image_model && reference_count > 12) {
+        fprintf(stderr, "h3: Ref2VA supports at most 12 references\n");
+        return 2;
     }
     params.references = references;
     params.reference_count = reference_count;
