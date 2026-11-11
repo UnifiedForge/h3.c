@@ -97,6 +97,9 @@ h3_resume_tests: tests/test_resume.o $(LIB_OBJ)
 h3_lora_gemm_bench: tests/bench_lora_gemm.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_sdpa_bench: tests/bench_sdpa.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

@@ -293,6 +293,55 @@ static int gpu_op(h3_dit *dit, int ok, char *error, size_t error_size,
     return 0;
 }
 
+/* accel-profiling: H3_OPPROF=1 splits every DiT block into GPU-timed
+ * segments (submit + wait at each cut, so the totals are slightly inflated by
+ * lost overlap, but each bucket is the real GPU time of its kernels).
+ * Off by default: with the variable unset nothing here executes. */
+enum { PROF_OTHER, PROF_QKV, PROF_ATTN, PROF_OUT, PROF_MLP, PROF_BUCKETS };
+static const char *const prof_names[PROF_BUCKETS] = {
+    "other", "adaln+qkv+rope", "sdpa", "attn_out", "gate+adaln+mlp"};
+static int prof_state = -1;
+static double prof_bucket[PROF_BUCKETS];
+static double prof_total[PROF_BUCKETS];
+static double prof_last_gpu;
+static double prof_last_wall;
+static double prof_gpu_bucket[PROF_BUCKETS];
+static double prof_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static unsigned prof_evals;
+static int prof_enabled(void) {
+    if (prof_state < 0) {
+        const char *v = getenv("H3_OPPROF");
+        prof_state = v && *v && strcmp(v, "0");
+    }
+    return prof_state;
+}
+static int prof_cut(h3_dit *dit, int bucket) {
+    if (!prof_enabled()) return 1;
+    if (!h3_gpu_submit(dit->gpu)) return 0;
+    h3_gpu_stats stats;
+    h3_gpu_get_stats(dit->gpu, &stats);
+    /* Wall time between two synchronised cuts: MPSGraph runs SDPA on child
+     * command buffers whose time the root GPUStart/End stamps do not see, so
+     * root gpu_seconds reads ~0 for attention. Each cut waits for the GPU, so
+     * the wall interval is that segment's encode + GPU execution. */
+    double now = prof_now();
+    prof_bucket[bucket] += now - prof_last_wall;
+    prof_gpu_bucket[bucket] += stats.gpu_seconds - prof_last_gpu;
+    prof_last_gpu = stats.gpu_seconds;
+    prof_last_wall = prof_now();
+    return h3_gpu_begin(dit->gpu);
+}
+static void prof_sync_baseline(h3_dit *dit) {
+    h3_gpu_stats stats;
+    h3_gpu_get_stats(dit->gpu, &stats);
+    prof_last_gpu = stats.gpu_seconds;
+    prof_last_wall = prof_now();
+}
+
 static void report(h3_dit_progress progress, void *opaque, const char *phase,
                    int completed, int total) {
     if (progress) progress(phase, completed, total, opaque);
@@ -2167,6 +2216,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    OP(prof_cut(dit, PROF_QKV), "opprof cut qkv");
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
@@ -2183,6 +2233,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    OP(prof_cut(dit, PROF_ATTN), "opprof cut sdpa");
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2210,6 +2261,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                          dit->attention_heads, rows, INNER, HIDDEN,
                          error, error_size)) return 0;
     }
+    OP(prof_cut(dit, PROF_OUT), "opprof cut attention output");
     /* UnifiedForge: rows × FFN×2 past 2^31 → the MLP runs in row chunks (32-bit kernel indexing) */
     int mlp_chunked = (uint64_t)rows * FFN * 2 > 0x7fffffffull;
     int fused_int8_mlp_input = !mlp_chunked && dit->int8_mlp &&
@@ -2372,6 +2424,30 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
     if (begin) OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
+    double prof_wall0 = 0.0;
+    if (prof_enabled()) {
+        OP(prof_cut(dit, PROF_OTHER), "opprof cut forward start");
+        memset(prof_bucket, 0, sizeof(prof_bucket));
+        memset(prof_gpu_bucket, 0, sizeof(prof_gpu_bucket));
+        prof_sync_baseline(dit);
+        prof_wall0 = stream_now();
+        if (!prof_evals) {
+            size_t kinds[6] = {0};
+            for (size_t i = 0; i < dit->layout.segment_count; i++) {
+                const h3_segment *g = &dit->layout.segments[i];
+                if ((unsigned)g->kind < 6) kinds[g->kind] += g->stop - g->start;
+            }
+            fprintf(stderr, "h3 opprof layout: seq=%u text=%zu cond=%zu "
+                    "ref_image=%zu ref_audio=%zu audio=%zu video=%zu "
+                    "segments=%zu heads=%d head_dim=%d hidden=%d ffn=%d "
+                    "active_blocks=%u\n",
+                    dit->sequence, kinds[H3_SEG_TEXT], kinds[H3_SEG_COND],
+                    kinds[H3_SEG_REF_IMAGE], kinds[H3_SEG_REF_AUDIO],
+                    kinds[H3_SEG_AUDIO], kinds[H3_SEG_VIDEO],
+                    dit->layout.segment_count, HEADS, HEAD_DIM, HIDDEN, FFN,
+                    dit->active_block_count);
+        }
+    }
     /* UnifiedForge: time-gated LoRA branches read this while encoding. */
     h3_lora_set_step_sigma(dit->sigmas.video[step]);
     size_t video_offset = 0;
@@ -2576,6 +2652,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 stream_started = 1;
             }
+            if (!prof_cut(dit, PROF_OTHER)) {
+                fail(error, error_size, "opprof cut: %s", h3_gpu_error(dit->gpu));
+                if (stream_started) (void)pthread_join(stream_thread, NULL);
+                return 0;
+            }
             int block_ok = run_block(
                 dit, block, step, weight, fused_token_adaln,
                 fused_attention_input_quantized,
@@ -2584,6 +2665,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 &carried_attention_input_quantized,
                 error, error_size);
             if (!block_ok) {
+                if (stream_started) (void)pthread_join(stream_thread, NULL);
+                return 0;
+            }
+            if (!prof_cut(dit, PROF_MLP)) {
+                fail(error, error_size, "opprof cut: %s", h3_gpu_error(dit->gpu));
                 if (stream_started) (void)pthread_join(stream_thread, NULL);
                 return 0;
             }
@@ -2709,6 +2795,24 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->video_output_bf16,
             dit->video_output, dit->video_rows * VIDEO_PATCH),
            "final video output cast");
+    }
+    if (prof_enabled()) {
+        OP(prof_cut(dit, PROF_OTHER), "opprof cut forward end");
+        double sum = 0.0;
+        for (int b = 0; b < PROF_BUCKETS; b++) {
+            sum += prof_bucket[b];
+            prof_total[b] += prof_bucket[b];
+        }
+        prof_evals++;
+        fprintf(stderr, "h3 opprof eval=%u step=%d core=%d rows=%u wall=%.3fs sum=%.3fs",
+                prof_evals, step, evaluate_core, dit->sequence,
+                stream_now() - prof_wall0, sum);
+        for (int b = 0; b < PROF_BUCKETS; b++)
+            fprintf(stderr, " %s=%.3fs(%.1f%%,rootgpu=%.3f)", prof_names[b],
+                    prof_bucket[b],
+                    sum > 0 ? 100.0 * prof_bucket[b] / sum : 0.0,
+                    prof_gpu_bucket[b]);
+        fprintf(stderr, "\n");
     }
     if (submit) OP(h3_gpu_submit(dit->gpu), "submit DiT forward");
 #undef OP
