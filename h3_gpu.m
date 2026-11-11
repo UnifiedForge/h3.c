@@ -112,6 +112,7 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3MLP *> *mlpCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
+@property(nonatomic) int conv3dAs2D; /* accel: default for h3_gpu_conv3d_f32, see h3_gpu_set_conv3d_as_2d */
 @property(nonatomic, strong) MPSCommandBuffer *mpsCommand;
 @property(nonatomic) BOOL reuseMPSCommandDefault;
 @property(nonatomic, copy) NSString *lastError;
@@ -988,6 +989,11 @@ int h3_gpu_get_stats(const h3_gpu *opaque, h3_gpu_stats *stats) {
     if (!opaque || !stats) return 0;
     *stats = GPU((h3_gpu *)(void *)opaque).stats;
     return 1;
+}
+
+void h3_gpu_set_conv3d_as_2d(h3_gpu *opaque, int enabled) {
+    H3GPU *gpu = GPU(opaque);
+    if (gpu) gpu.conv3dAs2D = enabled ? 1 : 0;
 }
 
 void h3_gpu_profile_set_label(h3_gpu *opaque, const char *label) {
@@ -1962,8 +1968,13 @@ static H3Conv *h3_gpu_conv3d_graph(
         MPSDataType half = !half_env ? MPSDataTypeFloat32 :
             !strcmp(half_env, "f16") ? MPSDataTypeFloat16 :
             !strcmp(half_env, "bf16") ? MPSDataTypeBFloat16 : MPSDataTypeFloat32;
+        /* accel: a Conv3d is computed as the sum over its temporal taps of
+         * Conv2d with frames as the batch (same math, f32 summation order
+         * differs: rel-L2 ~4e-6, 4x faster). Default comes from the caller
+         * (h3_gpu_set_conv3d_as_2d); H3_CONV3D_AS_2D=0|1 overrides it. */
         const char *as2d_env = getenv("H3_CONV3D_AS_2D");
-        int as2d = as2d_env && *as2d_env && strcmp(as2d_env, "0");
+        int as2d = as2d_env && *as2d_env ? strcmp(as2d_env, "0") != 0
+                                          : gpu.conv3dAs2D;
         NSString *key = [NSString stringWithFormat:
             @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%u:%d", batch, depth,
             height, width, input_channels, output_channels, kernel_depth,

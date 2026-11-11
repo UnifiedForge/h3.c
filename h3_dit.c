@@ -1460,7 +1460,7 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
-/* accel-lora-merge (H3_LORA_MERGE=1): fold every branch of a site into its
+/* accel-lora-merge (default on, H3_LORA_MERGE=0 disables): fold every branch of a site into its
  * resident bf16 base weight, W[out,in] += B[out,r] * A[r,in] (A already
  * carries strength * alpha/rank), before the weight is quantized to int8.
  * Exactly the arithmetic of an offline fused checkpoint, done at load for the
@@ -1501,7 +1501,7 @@ static int merge_site(h3_dit *dit, h3_lora_site *site, h3_gpu_tensor *weight,
              * weight is A^T laid out [in_dim, rank] */
             h3_gpu_linear_bf16(dit->gpu, merge_scratch, branch->b, a_t, NULL,
                                out_dim, rank, in_dim) &&
-            h3_gpu_add_bf16(dit->gpu, weight, weight, merge_scratch, elements) &&
+            h3_gpu_add_bf16(dit->gpu, weight, weight, merge_scratch, (uint32_t)elements) &&
             h3_gpu_submit(dit->gpu);
         free(a); free(at);
         h3_gpu_tensor_free(a_t);
@@ -1971,14 +1971,15 @@ static h3_dit *load_dit(const char *weight_directory,
             (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out);
         /* accel-lora-merge: every entry ungated and weights resident -> fold
          * the deltas into the weights at load and keep the fused paths. */
+        /* On by default; H3_LORA_MERGE=0 keeps the runtime branches. */
         const char *merge_env = getenv("H3_LORA_MERGE");
-        int mergeable = merge_env && *merge_env && strcmp(merge_env, "0") &&
-            !dit->ssd_streaming && lora_int8;
+        int merge_wanted = !(merge_env && !strcmp(merge_env, "0"));
+        int mergeable = merge_wanted && !dit->ssd_streaming && lora_int8;
         for (size_t e = 0; mergeable && e < loras->count; e++)
             if (loras->entries[e].from_sigma > 0.0f) mergeable = 0;
-        if (merge_env && *merge_env && strcmp(merge_env, "0"))
-            fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
-                    mergeable ? "on" : "off (streaming, bf16 path or a time-gated LoRA)");
+        fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
+                mergeable ? "on" : !merge_wanted ? "off (H3_LORA_MERGE=0)" :
+                "off (streaming, bf16 path or a time-gated LoRA)");
         dit->lora_merge = mergeable;
         if (mergeable) goto lora_flags_done;
         dit->fused_mlp = 0;

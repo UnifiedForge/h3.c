@@ -96,6 +96,8 @@ int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
  * print wall time alongside command-buffer GPU time and allocation counters. */
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);
+/* accel: compute Conv3d as a sum of Conv2d over temporal taps (default 0). */
+void h3_gpu_set_conv3d_as_2d(h3_gpu *gpu, int enabled);
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase);
 
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,

@@ -79,7 +79,7 @@ typedef struct {
      * by element count and handed out again. Safe because every scratch is
      * fully overwritten by its producer (pad writes every element, temporal
      * front included) and every user submits and waits before freeing.
-     * Opt-in while it is measured: H3_ENCODER_POOL=1. */
+     * On by default (byte-identical); H3_ENCODER_POOL=0 disables. */
     struct { h3_gpu_tensor *tensor; size_t elements; int in_use; } pool[160];
     int pool_count;
     int pool_off;
@@ -841,11 +841,18 @@ int h3_video_vae_encode(const char *weight_directory,
         return 0;
     }
     encoder_context encoder = {0};
+    /* accel: scratch buffer pool is on by default (byte-identical output);
+     * H3_ENCODER_POOL=0 turns it off. */
     const char *pool_env = getenv("H3_ENCODER_POOL");
-    encoder.pool_off = !(pool_env && *pool_env && strcmp(pool_env, "0"));
+    encoder.pool_off = pool_env && !strcmp(pool_env, "0");
     encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (encoder.gpu)
+    if (encoder.gpu) {
         h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
+        /* accel: fast Conv3d-as-Conv2d only for real video (guide, reference
+         * and history videos). Single images keep the original convolution,
+         * so image-only generations stay byte-identical. */
+        h3_gpu_set_conv3d_as_2d(encoder.gpu, frames > 1);
+    }
     if (encoder.gpu)
         encoder.store = h3_weight_store_open(weight_directory, error, error_size);
     ok = encoder.gpu && encoder.store &&
