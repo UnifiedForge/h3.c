@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     RGB_CHANNELS = 3,
@@ -361,6 +362,28 @@ static size_t tensor_elements(uint32_t depth, uint32_t height, uint32_t width,
     return (size_t)depth * height * width * channels;
 }
 
+/* accel: H3_ENCODER_OPPROF=1 times pad / Conv3d / group norm / other by
+ * synchronising after each (wall clock; MPSGraph work is on child buffers). */
+enum { EPROF_PAD, EPROF_CONV, EPROF_NORM, EPROF_OTHER, EPROF_N };
+static double eprof[EPROF_N], eprof_last;
+static int eprof_on = -1;
+static double eprof_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static int eprof_cut(encoder_context *encoder, int bucket) {
+    if (eprof_on < 0) eprof_on = getenv("H3_ENCODER_OPPROF") != NULL;
+    if (!eprof_on) return 1;
+    if (!h3_gpu_submit(encoder->gpu)) return 0;
+    double now = eprof_now();
+    if (eprof_last > 0) eprof[bucket] += now - eprof_last;
+    eprof_last = eprof_now();
+    return h3_gpu_begin(encoder->gpu);
+}
+static void eprof_mark(void) {
+    if (eprof_on > 0) eprof_last = eprof_now();
+}
+
 static h3_gpu_tensor *scratch_new(encoder_context *encoder, size_t elements) {
     if (!encoder->pool_off) {
         for (int index = 0; index < encoder->pool_count; index++)
@@ -403,17 +426,20 @@ static int conv_op(encoder_context *encoder, h3_gpu_tensor *output,
                 conv->input_channels, conv->depth_front, conv->height_before,
                 conv->height_after, conv->width_before, conv->width_after),
                 error, error_size, "visual encoder causal padding")) return 0;
+        if (!eprof_cut(encoder, EPROF_PAD)) return 0;
         source = padded;
         source_depth += conv->depth_front;
         source_height += conv->height_before + conv->height_after;
         source_width += conv->width_before + conv->width_after;
     }
-    return gpu_op(encoder, h3_gpu_conv3d_f32(
+    eprof_mark();
+    int conv_ok = gpu_op(encoder, h3_gpu_conv3d_f32(
         encoder->gpu, output, source, conv->weight, conv->bias, 1,
         source_depth, source_height, source_width, conv->input_channels,
         conv->output_channels, conv->kernel, conv->kernel, conv->kernel,
         conv->stride_t, conv->stride_h, conv->stride_w), error, error_size,
         "visual encoder Conv3d");
+    return conv_ok && eprof_cut(encoder, EPROF_CONV);
 }
 
 static h3_gpu_tensor *run_conv(encoder_context *encoder,
@@ -487,16 +513,19 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
     }
     ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
                 "begin visual encoder residual block") &&
+         (eprof_mark(), 1) &&
          gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
              encoder->gpu, norm1, input, block->norm1.weight, block->norm1.bias,
              1, depth, height, width, input_channels, GROUPS, 1e-6f),
              error, error_size, "visual encoder group norm 1") &&
+         eprof_cut(encoder, EPROF_NORM) &&
          conv_op(encoder, hidden, norm1, &block->conv1, depth, height, width,
                  pad1, error, error_size) &&
          gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
              encoder->gpu, norm2, hidden, block->norm2.weight, block->norm2.bias,
              1, depth, height, width, output_channels, GROUPS, 1e-6f),
              error, error_size, "visual encoder group norm 2") &&
+         eprof_cut(encoder, EPROF_NORM) &&
          conv_op(encoder, output, norm2, &block->conv2, depth, height, width,
                  pad2, error, error_size);
     const h3_gpu_tensor *residual = input;
@@ -559,7 +588,7 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
     h3_gpu_tensor *next = run_conv(encoder, hidden, &encoder->conv_in,
                                    depth, h, w, &next_d, &next_h, &next_w,
                                    error, error_size);
-    free_tensor(&hidden);
+    scratch_free(encoder, hidden); hidden = NULL;
     hidden = next;
     if (!hidden) return NULL;
     depth = next_d; h = next_h; w = next_w;
@@ -571,14 +600,14 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
             next = run_block(encoder, hidden,
                              &encoder->levels[level].blocks[block], depth, h, w,
                              input_channels, channels, error, error_size);
-            free_tensor(&hidden);
+            scratch_free(encoder, hidden); hidden = NULL;
             hidden = next;
         }
         if (hidden && encoder->levels[level].has_downsample) {
             next = run_conv(encoder, hidden,
                             &encoder->levels[level].downsample, depth, h, w,
                             &next_d, &next_h, &next_w, error, error_size);
-            free_tensor(&hidden);
+            scratch_free(encoder, hidden); hidden = NULL;
             hidden = next;
             depth = next_d; h = next_h; w = next_w;
         }
@@ -630,7 +659,7 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
                                      encoder->latent_std[channel];
                 }
     free(raw);
-    free_tensor(&hidden);
+    scratch_free(encoder, hidden); hidden = NULL;
     scratch_free(encoder, norm);
     scratch_free(encoder, padded);
     scratch_free(encoder, moments);
@@ -653,6 +682,11 @@ static void tile_axis_free(tile_axis *axis) {
 static int tile_axis_build(int extent, tile_axis *axis, char *error,
                            size_t error_size) {
     memset(axis, 0, sizeof(*axis));
+    /* accel: H3_ENCODER_TILE overrides the tile edge (multiple of 64) */
+    int TILE_PIXELS = 256;
+    const char *tile_env = getenv("H3_ENCODER_TILE");
+    if (tile_env && atoi(tile_env) >= 128 && atoi(tile_env) % 64 == 0)
+        TILE_PIXELS = atoi(tile_env);
     if (extent < SPATIAL_RATIO || extent % SPATIAL_RATIO) {
         fail(error, error_size,
              "visual encoder extent must be a multiple of %d", SPATIAL_RATIO);
@@ -817,6 +851,10 @@ int h3_video_vae_encode(const char *weight_directory,
     ok = encoder.gpu && encoder.store &&
          load_normalization(&encoder, weight_directory, error, error_size) &&
          load_weights(&encoder, error, error_size);
+    double timing_loaded = 0.0;
+    struct timespec timing_ts;
+    clock_gettime(CLOCK_MONOTONIC, &timing_ts);
+    timing_loaded = (double)timing_ts.tv_sec + (double)timing_ts.tv_nsec * 1e-9;
     int tile_count = y_axis.count * x_axis.count;
     float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
     if (ok && !tiles) {
@@ -839,6 +877,16 @@ int h3_video_vae_encode(const char *weight_directory,
             if (ok) latent_time = current_time;
             if (ok && progress) progress(completed + 1, tile_count, progress_opaque);
         }
+    if (eprof_on > 0)
+        fprintf(stderr, "h3 encoder opprof: pad=%.2fs conv3d=%.2fs groupnorm=%.2fs other=%.2fs\n",
+                eprof[EPROF_PAD], eprof[EPROF_CONV], eprof[EPROF_NORM], eprof[EPROF_OTHER]);
+    if (getenv("H3_ENCODER_TIMING")) {
+        clock_gettime(CLOCK_MONOTONIC, &timing_ts);
+        fprintf(stderr, "h3 encoder: %d tiles of %dx%d, tiles took %.2fs\n",
+                tile_count, y_axis.length, x_axis.length,
+                (double)timing_ts.tv_sec + (double)timing_ts.tv_nsec * 1e-9 -
+                timing_loaded);
+    }
     if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
                                 output, error, error_size) &&
                  h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);

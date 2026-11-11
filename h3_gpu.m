@@ -1955,11 +1955,20 @@ static H3Conv *h3_gpu_conv3d_graph(
         uint32_t output_depth, uint32_t output_height, uint32_t output_width,
         int has_bias) {
     @autoreleasepool {
+        /* accel: H3_CONV3D_HALF=f16|bf16 computes the convolution in half
+         * precision (inputs and weights cast inside the graph, result cast
+         * back to f32). Measurement knob; off by default. */
+        const char *half_env = getenv("H3_CONV3D_HALF");
+        MPSDataType half = !half_env ? MPSDataTypeFloat32 :
+            !strcmp(half_env, "f16") ? MPSDataTypeFloat16 :
+            !strcmp(half_env, "bf16") ? MPSDataTypeBFloat16 : MPSDataTypeFloat32;
+        const char *as2d_env = getenv("H3_CONV3D_AS_2D");
+        int as2d = as2d_env && *as2d_env && strcmp(as2d_env, "0");
         NSString *key = [NSString stringWithFormat:
-            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d", batch, depth,
+            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d:%u:%d", batch, depth,
             height, width, input_channels, output_channels, kernel_depth,
             kernel_height, kernel_width, stride_depth, stride_height,
-            stride_width, has_bias];
+            stride_width, has_bias, (unsigned)half, as2d];
         H3Conv *cached = gpu.convCache[key];
         if (cached) return cached;
         H3Conv *conv = [[H3Conv alloc] init];
@@ -1987,9 +1996,53 @@ static H3Conv *h3_gpu_conv3d_graph(
                 paddingStyle:MPSGraphPaddingStyleExplicit
                 dataLayout:MPSGraphTensorNamedDataLayoutNDHWC
                 weightsLayout:MPSGraphTensorNamedDataLayoutOIDHW];
-        MPSGraphTensor *result = [conv.graph
-            convolution3DWithSourceTensor:conv.input weightsTensor:conv.weight
+        MPSGraphTensor *source = conv.input, *weights = conv.weight;
+        if (half != MPSDataTypeFloat32) {
+            source = [conv.graph castTensor:source toType:half name:nil];
+            weights = [conv.graph castTensor:weights toType:half name:nil];
+        }
+        MPSGraphTensor *result = nil;
+        if (as2d && batch == 1) {
+            /* accel: Conv3d as a sum over temporal taps of Conv2d with the
+             * output frames as the batch: out[t] = sum_k conv2d(in[t*s+k],
+             * W[:,:,k]). Same products, f32 summation order differs. */
+            MPSGraphConvolution2DOpDescriptor *d2 =
+                [MPSGraphConvolution2DOpDescriptor
+                    descriptorWithStrideInX:stride_width strideInY:stride_height
+                    dilationRateInX:1 dilationRateInY:1 groups:1
+                    paddingLeft:0 paddingRight:0 paddingTop:0 paddingBottom:0
+                    paddingStyle:MPSGraphPaddingStyleExplicit
+                    dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+            for (uint32_t k = 0; k < kernel_depth; k++) {
+                MPSGraphTensor *x = [conv.graph sliceTensor:source
+                    starts:@[@0, @(k), @0, @0, @0]
+                    ends:@[@1, @(k + (output_depth - 1) * stride_depth + 1),
+                           @(height), @(width), @(input_channels)]
+                    strides:@[@1, @(stride_depth), @1, @1, @1] name:nil];
+                x = [conv.graph reshapeTensor:x withShape:@[@(output_depth),
+                    @(height), @(width), @(input_channels)] name:nil];
+                MPSGraphTensor *w = [conv.graph sliceTensor:weights
+                    dimension:2 start:k length:1 name:nil];
+                w = [conv.graph reshapeTensor:w withShape:@[@(output_channels),
+                    @(input_channels), @(kernel_height), @(kernel_width)]
+                    name:nil];
+                MPSGraphTensor *y = [conv.graph
+                    convolution2DWithSourceTensor:x weightsTensor:w
+                    descriptor:d2 name:nil];
+                result = result ? [conv.graph additionWithPrimaryTensor:result
+                                              secondaryTensor:y name:nil] : y;
+            }
+            result = [conv.graph reshapeTensor:result withShape:@[@1,
+                @(output_depth), @(output_height), @(output_width),
+                @(output_channels)] name:nil];
+        } else
+        result = [conv.graph
+            convolution3DWithSourceTensor:source weightsTensor:weights
             descriptor:descriptor name:nil];
+        if (half != MPSDataTypeFloat32)
+            result = [conv.graph castTensor:result toType:MPSDataTypeFloat32
+                                       name:nil];
         if (has_bias) {
             conv.bias = [conv.graph placeholderWithShape:conv.biasShape
                                                 dataType:MPSDataTypeFloat32
