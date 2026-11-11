@@ -2585,6 +2585,271 @@ cleanup:
     return result;
 }
 
+/* ---- h3image: MiniMax-H3-Image text-to-image -------------------------------
+ * The image DiT is the H3 transformer without its audio stream, distilled to
+ * six sampling steps with one output head per step (PDD). The packed sequence
+ * is [text | image]: text rows at rotary t = 0..n-1, image rows at t = n on
+ * the same area-normalised (h, w) grid H3 uses, so the existing layout builder
+ * produces it with latent_t = 1 and audio_t = 0. The prompt is used verbatim
+ * (no template, no special tokens, at most 4096 tokens) and the DiT reads text
+ * layer 50, as in the reference pipeline (diffusers MiniMaxH3Image*, Apache-2.0,
+ * read for the algorithm, not copied). */
+
+#define H3_IMAGE_MAX_TEXT_TOKENS 4096
+#define H3_IMAGE_STEPS 6
+
+static int h3_image_read_sigmas(const char *model_dir, float *sigmas,
+                                char *error, size_t error_size) {
+    char *path = h3_path(model_dir, "pdd_config.json");
+    FILE *file = path ? fopen(path, "rb") : NULL;
+    char text[4096];
+    size_t length = file ? fread(text, 1, sizeof(text) - 1, file) : 0;
+    if (file) fclose(file);
+    text[length] = '\0';
+    const char *cursor = strstr(text, "\"sigmas\"");
+    cursor = cursor ? strchr(cursor, '[') : NULL;
+    int count = 0;
+    while (cursor && *cursor && *cursor != ']' && count <= H3_IMAGE_STEPS) {
+        cursor++;
+        while (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' ||
+               *cursor == '\t') cursor++;
+        if (*cursor == ']') break;
+        char *end = NULL;
+        double value = strtod(cursor, &end);
+        if (end == cursor) break;
+        sigmas[count++] = (float)value;
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' ||
+               *cursor == '\t') cursor++;
+        if (*cursor != ',') break;
+    }
+    int ok = count == H3_IMAGE_STEPS + 1 && sigmas[0] == 1.0f &&
+             sigmas[H3_IMAGE_STEPS] == 0.0f;
+    for (int i = 1; ok && i <= H3_IMAGE_STEPS; i++)
+        if (!(sigmas[i] < sigmas[i - 1])) ok = 0;
+    if (!ok)
+        snprintf(error, error_size, "%s: expected %d decreasing sigmas from 1 "
+                 "to 0", path ? path : "pdd_config.json", H3_IMAGE_STEPS + 1);
+    free(path);
+    return ok;
+}
+
+/* H3_IMAGE_DUMP=DIR writes the run's intermediates as raw F32/U32 files for
+ * the component checks against the reference. */
+static void h3_image_dump(const char *name, const void *data, size_t bytes) {
+    const char *dir = getenv("H3_IMAGE_DUMP");
+    if (!dir || !*dir || !data) return;
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *file = fopen(path, "wb");
+    if (!file) return;
+    fwrite(data, 1, bytes, file);
+    fclose(file);
+}
+
+h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
+                             const h3_params *params) {
+    if (!ctx) return NULL;
+    ctx->error[0] = '\0';
+    if (!prompt || !*prompt || !params || !params->image_model) {
+        h3_set_error(ctx, "image generation needs a prompt and --image-model");
+        return NULL;
+    }
+    int width = params->width, height = params->height;
+    if (width < 256 || height < 256 || width % 32 || height % 32 ||
+        (double)width * height > 25.0 * 1024 * 1024) {
+        h3_set_error(ctx, "image size must be multiples of 32, at least 256, "
+                     "at most ~26 MP (best 4-20 MP)");
+        return NULL;
+    }
+    if (!params->save_latent) {
+        h3_set_error(ctx, "image generation writes a latent: pass --save-latent");
+        return NULL;
+    }
+    if (params->reference_count || params->first_frame || params->last_frame ||
+        params->guide_video || params->history_video || params->init_video ||
+        params->init_latent || params->token_reduction ||
+        params->core_reuse > 1 || params->denoise_reuse > 1) {
+        h3_set_error(ctx, "image generation is text-to-image only for now "
+                     "(no references, frames, guides, reuse or token reduction)");
+        return NULL;
+    }
+    h3_generation_progress progress = {ctx, params, 0};
+    char detail[512];
+    h3_tokenizer *tokenizer = NULL;
+    uint32_t *ids = NULL;
+    size_t token_count = 0;
+    h3_text_embedding text;
+    memset(&text, 0, sizeof(text));
+    h3_layout layout;
+    memset(&layout, 0, sizeof(layout));
+    h3_dit *dit = NULL;
+    h3_lora_set loras;
+    memset(&loras, 0, sizeof(loras));
+    h3_memory_ceiling ceiling;
+    memset(&ceiling, 0, sizeof(ceiling));
+    float *latent = NULL, *velocity = NULL;
+    h3_result *result = NULL;
+    int latent_w = width / H3_VAE_SPATIAL_RATIO;
+    int latent_h = height / H3_VAE_SPATIAL_RATIO;
+    char *tokenizer_path = h3_path(params->image_model, "tokenizer/tokenizer.json");
+    char *text_path = h3_path(ctx->model_dir, "FL2VA/text_encoder");
+    char *dit_path = h3_path(params->image_model, "transformer");
+    char *heads_path = h3_path(params->image_model, "pdd_fused_heads.safetensors");
+    if (!tokenizer_path || !text_path || !dit_path || !heads_path) {
+        h3_set_error(ctx, "out of memory resolving image model paths");
+        goto cleanup;
+    }
+    float pdd_sigmas[H3_IMAGE_STEPS + 1];
+    if (!h3_image_read_sigmas(params->image_model, pdd_sigmas, detail,
+                              sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    if (!h3_lora_set_build(ctx, params, &loras)) goto cleanup;
+    h3_memory_ceiling_take(ctx->device.recommended_working_set, &ceiling);
+    if (!h3_memory_gate_preflight(&ceiling, &loras, 0, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+
+    h3_progress_emit(&progress, "tokenizer", 0, 1);
+    tokenizer = h3_tokenizer_load(tokenizer_path, detail, sizeof(detail));
+    if (!tokenizer ||
+        !h3_tokenizer_encode(tokenizer, prompt, 1, &ids, &token_count,
+                             detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    h3_progress_emit(&progress, "tokenizer", 1, 1);
+    if (token_count > H3_IMAGE_MAX_TEXT_TOKENS) {
+        fprintf(stderr, "h3: prompt truncated from %zu to %d tokens\n",
+                token_count, H3_IMAGE_MAX_TEXT_TOKENS);
+        token_count = H3_IMAGE_MAX_TEXT_TOKENS;
+    }
+    h3_image_dump("tokens.u32", ids, token_count * sizeof(*ids));
+    h3_progress_emit(&progress, "text encoder", 0, 50);
+    if (!h3_text_encode_bf16(text_path, "h3_shaders.metal", ids, token_count,
+                             h3_text_progress_bridge, &progress, &text,
+                             detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    if (getenv("H3_IMAGE_DUMP")) {
+        size_t n = text.tokens * text.width;
+        float *values = malloc(n * sizeof(*values));
+        for (size_t i = 0; values && i < n; i++) {
+            uint32_t bits = (uint32_t)text.values[i] << 16;
+            memcpy(&values[i], &bits, sizeof(bits));
+        }
+        h3_image_dump("text.f32", values, n * sizeof(*values));
+        free(values);
+    }
+    if (progress.cancelled) goto cleanup;
+
+    h3_layout_spec spec = {(int)text.tokens, 1, latent_h, latent_w, 0, 5,
+                           NULL, 0, NULL, 0, 0, 0, 0, 0.0};
+    if (!h3_layout_build(&spec, &layout, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    h3_sigma_schedule sigmas;
+    memset(&sigmas, 0, sizeof(sigmas));
+    sigmas.steps = H3_IMAGE_STEPS;
+    for (int i = 0; i <= H3_IMAGE_STEPS; i++)
+        sigmas.video[i] = sigmas.audio[i] = pdd_sigmas[i];
+    dit = h3_dit_load_t2va(
+        dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+        (unsigned)params->dit_layers, 1, 0, params->ssd_streaming, 1.0f,
+        params->use_slower_bf16_mlp, params->use_slower_bf16_qkv,
+        params->use_slower_bf16_attention_output,
+        params->use_slower_row_major_attention_output,
+        params->use_slower_unfused_int8_inputs,
+        params->use_slower_unfused_qkv_rope, params->use_slower_scalar_qkv_rms,
+        params->use_slower_uncached_int8_scales,
+        params->use_slower_dynamic_fc1_k, params->use_slower_grouped_quantizer,
+        params->use_int8_row_fc2, &loras,
+        h3_dit_progress_bridge, &progress, detail, sizeof(detail));
+    if (!dit || !h3_dit_load_step_heads(dit, heads_path, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    h3_dit_arm_memory_gate(dit, &ceiling);
+    h3_text_embedding_free(&text);
+
+    size_t count = h3_dit_video_elements(dit);
+    latent = malloc(count * sizeof(*latent));
+    velocity = malloc(count * sizeof(*velocity));
+    if (!latent || !velocity) {
+        h3_set_error(ctx, "out of memory allocating the image latent");
+        goto cleanup;
+    }
+    if (params->noise_file) {
+        FILE *file = fopen(params->noise_file, "rb");
+        size_t got = file ? fread(latent, sizeof(*latent), count, file) : 0;
+        int extra = file && fgetc(file) != EOF;
+        if (file) fclose(file);
+        if (got != count || extra) {
+            h3_set_error(ctx, "%s: expected exactly %zu F32 values "
+                         "([24,1,%d,%d])", params->noise_file, count,
+                         latent_h, latent_w);
+            goto cleanup;
+        }
+    } else {
+        h3_rng rng;
+        h3_rng_seed(&rng, params->seed);
+        h3_rng_fill_normal(&rng, latent, count);
+    }
+    h3_image_dump("noise.f32", latent, count * sizeof(*latent));
+    for (int step = 0; step < H3_IMAGE_STEPS; step++) {
+        h3_progress_emit(&progress, "denoise", step, H3_IMAGE_STEPS);
+        if (progress.cancelled) goto cleanup;
+        if (!h3_dit_forward(dit, step, latent, NULL, velocity, NULL,
+                            detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "velocity_%d.f32", step);
+        h3_image_dump(name, velocity, count * sizeof(*velocity));
+        /* x_next = x + (sigma - sigma_next) * v, in F32 (the "velocity" form
+         * the PDD heads were distilled with). */
+        if (!h3_euler_velocity_step(latent, velocity, count, pdd_sigmas[step],
+                                    pdd_sigmas[step + 1])) {
+            h3_set_error(ctx, "invalid image sampler step");
+            goto cleanup;
+        }
+    }
+    h3_progress_emit(&progress, "denoise", H3_IMAGE_STEPS, H3_IMAGE_STEPS);
+    if (!h3_write_latent_file(params->save_latent, latent, 1, latent_h,
+                              latent_w, NULL, 0, width, height, 1,
+                              detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    fprintf(stderr, "h3: saved image latent %s\n", params->save_latent);
+    result = calloc(1, sizeof(*result));
+    if (!result) {
+        h3_set_error(ctx, "out of memory creating image result");
+        goto cleanup;
+    }
+    result->width = width;
+    result->height = height;
+    result->frames = 1;
+    result->seed = params->seed;
+
+cleanup:
+    free(tokenizer_path); free(text_path); free(dit_path); free(heads_path);
+    if (ids) h3_tokenizer_ids_free(ids);
+    h3_tokenizer_free(tokenizer);
+    h3_text_embedding_free(&text);
+    h3_layout_free(&layout);
+    h3_dit_free(dit);
+    h3_lora_set_free(&loras);
+    free(latent); free(velocity);
+    return result;
+}
+
 void h3_result_free(h3_result *result) {
     free(result);
 }

@@ -207,6 +207,13 @@ struct h3_dit {
     h3_gpu_tensor *video_output_bf16;
     h3_gpu_tensor *previous_audio_velocity;
     h3_gpu_tensor *previous_video_velocity;
+    /* h3image: MiniMax-H3-Image has no audio stream (audio_t == 0) and one
+     * output head per distilled sampling step (PDD). When pdd_steps > 0,
+     * step i projects with pdd_w[i]/pdd_b[i] instead of final_video_w/b. */
+    int no_audio;
+    int pdd_steps;
+    h3_gpu_tensor *pdd_w[16];
+    h3_gpu_tensor *pdd_b[16];
     /* one shared bf16 intermediate for every branch of every
      * projection of every block, sized on the active set's maximum rank, plus
      * one shared delta of the widest targeted output. Both are allocated at
@@ -416,7 +423,7 @@ static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
         layout->segments[0].kind != H3_SEG_TEXT ||
         layout->segments[layout->segment_count - 1].kind != H3_SEG_VIDEO ||
         layout->signature[1] < 1 || layout->signature[2] < 2 ||
-        layout->signature[3] < 2 || layout->signature[4] < 1 ||
+        layout->signature[3] < 2 || layout->signature[4] < 0 ||
         layout->signature[2] % 2 || layout->signature[3] % 2 ||
         layout->seq_len > UINT32_MAX || text->tokens > UINT32_MAX ||
         layout->img_cond_rows > UINT32_MAX ||
@@ -1236,7 +1243,8 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
     uint32_t *rows = malloc((size_t)dit->sequence * sizeof(*rows));
     uint32_t *reduced = dit->token_reduction ?
         malloc((size_t)dit->reduced_sequence * sizeof(*reduced)) : NULL;
-    uint32_t *audio = malloc((size_t)dit->audio_rows * sizeof(*audio));
+    uint32_t audio_map_rows = dit->audio_rows ? dit->audio_rows : 1;
+    uint32_t *audio = malloc((size_t)audio_map_rows * sizeof(*audio));
     uint32_t *video = malloc((size_t)dit->video_rows * sizeof(*video));
     if (!dit->row_maps || !dit->final_audio_maps || !dit->final_video_maps ||
         (dit->token_reduction && (!dit->reduced_row_maps || !reduced)) ||
@@ -1265,14 +1273,14 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
         }
         uint32_t audio_row = h3_dit_schedule_audio_row(dit->schedule, step);
         uint32_t video_row = h3_dit_schedule_video_row(dit->schedule, step);
-        for (uint32_t index = 0; index < dit->audio_rows; index++)
+        for (uint32_t index = 0; index < audio_map_rows; index++)
             audio[index] = audio_row;
         for (uint32_t index = 0; index < dit->video_rows; index++)
             video[index] = video_row;
         dit->row_maps[step] = h3_gpu_tensor_from_u32(
             dit->gpu, rows, dit->sequence);
         dit->final_audio_maps[step] = h3_gpu_tensor_from_u32(
-            dit->gpu, audio, dit->audio_rows);
+            dit->gpu, audio, audio_map_rows);
         dit->final_video_maps[step] = h3_gpu_tensor_from_u32(
             dit->gpu, video, dit->video_rows);
         if (!dit->row_maps[step] ||
@@ -1589,22 +1597,26 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                             VIDEO_PATCH, error, error_size);
     dit->video_patch_b = f1(dit, "video_patch_proj.bias", HIDDEN,
                             error, error_size);
+    if (!dit->no_audio) {
     dit->audio_patch_w = f2(dit, "audio_patch_proj.weight", HIDDEN,
                             AUDIO_CHANNELS, error, error_size);
     dit->audio_patch_b = f1(dit, "audio_patch_proj.bias", HIDDEN,
                             error, error_size);
+    }
     dit->final_norm = bf1(dit, "final_layer.norm.weight", HIDDEN,
                           error, error_size);
     dit->final_video_w = f2(dit, "final_layer.video_out.weight", VIDEO_PATCH,
                             HIDDEN, error, error_size);
     dit->final_video_b = f1(dit, "final_layer.video_out.bias", VIDEO_PATCH,
                             error, error_size);
+    if (!dit->no_audio) {
     dit->final_audio_w = f2(dit, "final_layer.audio_out.weight", AUDIO_CHANNELS,
                             HIDDEN, error, error_size);
     dit->final_audio_b = f1(dit, "final_layer.audio_out.bias", AUDIO_CHANNELS,
                             error, error_size);
-    if (dit->bf16_final && dit->final_video_w && dit->final_video_b &&
-        dit->final_audio_w && dit->final_audio_b) {
+    }
+    if (dit->bf16_final && !dit->no_audio && dit->final_video_w &&
+        dit->final_video_b && dit->final_audio_w && dit->final_audio_b) {
         h3_gpu_tensor *source[4] = {
             dit->final_video_w, dit->final_video_b,
             dit->final_audio_w, dit->final_audio_b
@@ -1641,16 +1653,19 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             return 0;
         }
     }
-    return dit->video_patch_w && dit->video_patch_b && dit->audio_patch_w &&
-           dit->audio_patch_b && dit->final_norm && dit->final_video_w &&
-           dit->final_video_b && dit->final_audio_w && dit->final_audio_b;
+    return dit->video_patch_w && dit->video_patch_b && dit->final_norm &&
+           dit->final_video_w && dit->final_video_b &&
+           (dit->no_audio || (dit->audio_patch_w && dit->audio_patch_b &&
+                              dit->final_audio_w && dit->final_audio_b));
 }
 
 static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t sequence = dit->sequence;
-    size_t audio = dit->audio_rows;
+    /* h3image: an audio-free layout has zero audio rows; keep one dummy row
+     * so every buffer still exists (Metal refuses zero-length buffers). */
+    size_t audio = dit->audio_rows ? dit->audio_rows : 1;
     size_t video = dit->video_rows;
-    size_t audio_total = dit->audio_total_rows;
+    size_t audio_total = dit->audio_total_rows ? dit->audio_total_rows : 1;
     size_t video_total = dit->video_total_rows;
     dit->activation_aliases = !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
     dit->fused_patch_projection =
@@ -1906,6 +1921,11 @@ static h3_dit *load_dit(const char *weight_directory,
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
                                    error, error_size)) goto failed;
+    /* h3image: an audio-free layout (MiniMax-H3-Image). Its released output
+     * heads are F32 and the reference runs them in F32, so keep the F32 head
+     * unless H3_IMAGE_BF16_FINAL asks for the faster BF16 one. */
+    dit->no_audio = dit->audio_t == 0 && dit->audio_total_rows == 0;
+    if (dit->no_audio && !getenv("H3_IMAGE_BF16_FINAL")) dit->bf16_final = 0;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -2545,7 +2565,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->video_patch_b, dit->video_projection_map, dit->sequence,
                 dit->video_total_rows, VIDEO_PATCH, HIDDEN),
                "project mapped video sources");
-        if (dit->audio_projection_map)
+        if (dit->audio_projection_map && dit->audio_total_rows)
             OP(h3_gpu_patch_linear_bf16_map(
                 dit->gpu, dit->hidden, dit->audio_input, dit->audio_patch_w,
                 dit->audio_patch_b, dit->audio_projection_map, dit->sequence,
@@ -2569,7 +2589,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                         dit->video_patch_b, (uint32_t)segment_rows,
                         VIDEO_PATCH, HIDDEN), "project packed video source");
                 video_offset += segment_rows;
-            } else {
+            } else if (segment_rows) {
                 if (!dit->audio_projection_map)
                     OP(h3_gpu_patch_linear_bf16_offset(
                         dit->gpu, dit->hidden, destination, dit->audio_input,
@@ -2587,6 +2607,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->video_patch_w, dit->video_patch_b,
                 dit->video_total_rows, VIDEO_PATCH, HIDDEN),
                "fused video patch projection");
+            if (dit->audio_total_rows)
             OP(h3_gpu_patch_linear_bf16(
                 dit->gpu, dit->audio_projected, dit->audio_input,
                 dit->audio_patch_w, dit->audio_patch_b,
@@ -2598,6 +2619,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->video_patch_w, dit->video_patch_b,
                 dit->video_total_rows, VIDEO_PATCH, HIDDEN),
                "video patch projection");
+            if (dit->audio_total_rows)
             OP(h3_gpu_linear_f32(
                 dit->gpu, dit->audio_projected_f32, dit->audio_input,
                 dit->audio_patch_w, dit->audio_patch_b,
@@ -2606,6 +2628,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             OP(h3_gpu_cast_f32_to_bf16(
                 dit->gpu, dit->video_projected, dit->video_projected_f32,
                 dit->video_total_rows * HIDDEN), "video BF16 cast");
+            if (dit->audio_total_rows)
             OP(h3_gpu_cast_f32_to_bf16(
                 dit->gpu, dit->audio_projected, dit->audio_projected_f32,
                 dit->audio_total_rows * HIDDEN), "audio BF16 cast");
@@ -2626,7 +2649,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                     video_offset * HIDDEN, segment_rows * HIDDEN),
                    "pack video source");
                 video_offset += segment_rows;
-            } else {
+            } else if (segment_rows) {
                 OP(h3_gpu_copy_bf16(
                     dit->gpu, dit->hidden, destination, dit->audio_projected,
                     audio_offset * HIDDEN, segment_rows * HIDDEN),
@@ -2808,11 +2831,16 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     }
     dit->core_forward_count++;
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
+    /* h3image: per-step PDD output head when loaded. */
+    h3_gpu_tensor *video_head_w = dit->pdd_steps && step < dit->pdd_steps ?
+        dit->pdd_w[step] : dit->final_video_w;
+    h3_gpu_tensor *video_head_b = dit->pdd_steps && step < dit->pdd_steps ?
+        dit->pdd_b[step] : dit->final_video_b;
     int fused_final_head = dit->bf16_final &&
         !getenv("H3_DISABLE_FUSED_FINAL_HEAD") &&
         !getenv("H3_DISABLE_FUSED_FINAL_SLICE");
     if (fused_final_head) {
-        OP(h3_gpu_adaln_linear_bf16(
+        if (!dit->no_audio) OP(h3_gpu_adaln_linear_bf16(
             dit->gpu, dit->audio_output_bf16, dit->final_audio_inverse,
             dit->hidden, (size_t)dit->audio_target_start * HIDDEN,
             dit->final_norm, final, dit->final_audio_maps[step],
@@ -2823,17 +2851,17 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->gpu, dit->video_output_bf16, dit->final_video_inverse,
             dit->hidden, (size_t)dit->video_target_start * HIDDEN,
             dit->final_norm, final, dit->final_video_maps[step],
-            dit->final_video_w, dit->final_video_b, dit->video_rows, HIDDEN,
+            video_head_w, video_head_b, dit->video_rows, HIDDEN,
             VIDEO_PATCH, FINAL_SLOTS, 0, 1, 1e-5f),
            "fused final video AdaLN/head");
     } else if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
-        OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
+        if (!dit->no_audio) OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
             (size_t)dit->audio_target_start * HIDDEN,
             (size_t)dit->audio_rows * HIDDEN), "slice final audio");
         OP(h3_gpu_copy_bf16(dit->gpu, dit->final_video_input, 0, dit->hidden,
             (size_t)dit->video_target_start * HIDDEN,
             (size_t)dit->video_rows * HIDDEN), "slice final video");
-        OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_audio_norm,
+        if (!dit->no_audio) OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_audio_norm,
             dit->final_audio_input, dit->final_norm, final,
             dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
             0, 1, 1e-5f), "final audio AdaLN");
@@ -2842,7 +2870,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
             0, 1, 1e-5f), "final video AdaLN");
     } else {
-        OP(h3_gpu_adaln_bf16_offset(
+        if (!dit->no_audio) OP(h3_gpu_adaln_bf16_offset(
             dit->gpu, dit->final_audio_norm, dit->hidden,
             (size_t)dit->audio_target_start * HIDDEN, dit->final_norm, final,
             dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
@@ -2854,28 +2882,28 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             0, 1, 1e-5f), "fused final video slice/AdaLN");
     }
     if (dit->bf16_final && !fused_final_head) {
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->audio_output_bf16,
+        if (!dit->no_audio) OP(h3_gpu_linear_bf16(dit->gpu, dit->audio_output_bf16,
             dit->final_audio_norm, dit->final_audio_w, dit->final_audio_b,
             dit->audio_rows, HIDDEN, AUDIO_CHANNELS),
            "BF16 final audio head");
         OP(h3_gpu_linear_bf16(dit->gpu, dit->video_output_bf16,
-            dit->final_video_norm, dit->final_video_w, dit->final_video_b,
+            dit->final_video_norm, video_head_w, video_head_b,
             dit->video_rows, HIDDEN, VIDEO_PATCH),
            "BF16 final video head");
     } else if (!dit->bf16_final) {
-        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
+        if (!dit->no_audio) OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
             dit->final_audio_norm, dit->audio_rows * HIDDEN),
            "final audio F32 cast");
         OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_video_f32,
             dit->final_video_norm, dit->video_rows * HIDDEN),
            "final video F32 cast");
-        OP(h3_gpu_linear_f32(dit->gpu, dit->audio_output,
+        if (!dit->no_audio) OP(h3_gpu_linear_f32(dit->gpu, dit->audio_output,
             dit->final_audio_f32, dit->final_audio_w, dit->final_audio_b,
             dit->audio_rows, HIDDEN, AUDIO_CHANNELS), "final audio head");
         OP(h3_gpu_linear_f32(dit->gpu, dit->video_output,
-            dit->final_video_f32, dit->final_video_w, dit->final_video_b,
+            dit->final_video_f32, video_head_w, video_head_b,
             dit->video_rows, HIDDEN, VIDEO_PATCH), "final video head");
-        OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->audio_output_bf16,
+        if (!dit->no_audio) OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->audio_output_bf16,
             dit->audio_output, dit->audio_rows * AUDIO_CHANNELS),
            "final audio output cast");
         OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->video_output_bf16,
@@ -2959,16 +2987,118 @@ int h3_dit_reset_run(h3_dit *dit,
     return 1;
 }
 
+/* h3image: one evaluation of the audio-free image model. The velocity is
+ * read back in F32 when the F32 head ran (the reference keeps it F32). */
+static int forward_image(h3_dit *dit, int step, const float *video_latent,
+                         float *video_velocity, char *error,
+                         size_t error_size) {
+    size_t elements = (size_t)dit->video_rows * VIDEO_PATCH;
+    float *rows = malloc(elements * sizeof(*rows));
+    float *out = malloc(elements * sizeof(*out));
+    uint16_t *out_bf16 = dit->bf16_final ?
+        malloc(elements * sizeof(*out_bf16)) : NULL;
+    int ok = rows && out && (!dit->bf16_final || out_bf16);
+    if (!ok) fail(error, error_size, "out of memory packing image latents");
+    if (ok) ok = h3_dit_patchify_video(video_latent, VIDEO_CHANNELS,
+            dit->latent_t, dit->latent_h, dit->latent_w, rows, elements) &&
+        h3_gpu_tensor_write_f32_range(dit->video_input,
+            (size_t)dit->video_condition_rows * VIDEO_PATCH, rows, elements);
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot pack/write image latents");
+    if (ok) ok = encode_forward(dit, step, 1, 1, 0, error, error_size);
+    if (ok) {
+        if (dit->bf16_final) {
+            ok = h3_gpu_tensor_read_bf16(dit->video_output_bf16, out_bf16,
+                                         elements);
+            for (size_t index = 0; ok && index < elements; index++) {
+                uint32_t bits = (uint32_t)out_bf16[index] << 16;
+                memcpy(&out[index], &bits, sizeof(bits));
+            }
+        } else {
+            ok = h3_gpu_tensor_read_f32(dit->video_output, out, elements);
+        }
+        if (!ok && (!error || !*error))
+            fail(error, error_size, "cannot read image velocity");
+    }
+    if (ok) ok = h3_dit_unpatchify_video(out, VIDEO_CHANNELS, dit->latent_t,
+            dit->latent_h, dit->latent_w, video_velocity,
+            h3_dit_video_elements(dit));
+    free(rows); free(out); free(out_bf16);
+    return ok;
+}
+
+int h3_dit_load_step_heads(h3_dit *dit, const char *path,
+                           char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    h3_st_header header;
+    memset(&header, 0, sizeof(header));
+    if (!dit || !path || !h3_st_read_header(path, &header, error, error_size))
+        return 0;
+    const h3_st_tensor *w = h3_st_find(&header, "video_out.weight");
+    const h3_st_tensor *b = h3_st_find(&header, "video_out.bias");
+    int steps = w ? (int)w->shape[0] : 0;
+    int ok = w && b && w->dtype == H3_DTYPE_F32 && b->dtype == H3_DTYPE_F32 &&
+        w->ndim == 3 && b->ndim == 2 && steps >= 1 && steps <= 16 &&
+        steps == h3_dit_schedule_steps(dit->schedule) &&
+        w->shape[1] == VIDEO_PATCH && w->shape[2] == HIDDEN &&
+        b->shape[0] == (uint64_t)steps && b->shape[1] == VIDEO_PATCH;
+    if (!ok) {
+        fail(error, error_size, "%s: expected F32 video_out.weight [steps=%d,"
+             "%d,%d] and video_out.bias", path,
+             h3_dit_schedule_steps(dit->schedule), VIDEO_PATCH, HIDDEN);
+        h3_st_free_header(&header);
+        return 0;
+    }
+    size_t we = (size_t)steps * VIDEO_PATCH * HIDDEN;
+    size_t be = (size_t)steps * VIDEO_PATCH;
+    float *wv = malloc(we * sizeof(*wv));
+    float *bv = malloc(be * sizeof(*bv));
+    ok = wv && bv &&
+        h3_st_read_data(&header, w, wv, we * sizeof(*wv), error, error_size) &&
+        h3_st_read_data(&header, b, bv, be * sizeof(*bv), error, error_size);
+    for (int i = 0; ok && i < steps; i++) {
+        dit->pdd_w[i] = h3_gpu_tensor_from_f32(dit->gpu,
+            wv + (size_t)i * VIDEO_PATCH * HIDDEN, (size_t)VIDEO_PATCH * HIDDEN);
+        dit->pdd_b[i] = h3_gpu_tensor_from_f32(dit->gpu,
+            bv + (size_t)i * VIDEO_PATCH, VIDEO_PATCH);
+        if (!dit->pdd_w[i] || !dit->pdd_b[i]) ok = 0;
+        if (ok && dit->bf16_final) {
+            h3_gpu_tensor *wb = h3_gpu_tensor_new_bf16(dit->gpu,
+                (size_t)VIDEO_PATCH * HIDDEN);
+            h3_gpu_tensor *bb = h3_gpu_tensor_new_bf16(dit->gpu, VIDEO_PATCH);
+            ok = wb && bb && h3_gpu_begin(dit->gpu) &&
+                h3_gpu_cast_f32_to_bf16(dit->gpu, wb, dit->pdd_w[i],
+                                        (uint32_t)VIDEO_PATCH * HIDDEN) &&
+                h3_gpu_cast_f32_to_bf16(dit->gpu, bb, dit->pdd_b[i],
+                                        (uint32_t)VIDEO_PATCH) &&
+                h3_gpu_submit(dit->gpu);
+            h3_gpu_tensor_free(dit->pdd_w[i]);
+            h3_gpu_tensor_free(dit->pdd_b[i]);
+            dit->pdd_w[i] = wb;
+            dit->pdd_b[i] = bb;
+        }
+    }
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot load PDD output heads from %s", path);
+    if (ok) dit->pdd_steps = steps;
+    free(wv); free(bv);
+    h3_st_free_header(&header);
+    return ok;
+}
+
 int h3_dit_forward(h3_dit *dit, int step,
                    const float *video_latent, const float *audio_latent,
                    float *video_velocity, float *audio_velocity,
                    char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!dit || step < 0 || step >= h3_dit_schedule_steps(dit->schedule) ||
-        !video_latent || !audio_latent || !video_velocity || !audio_velocity) {
+        !video_latent || !video_velocity ||
+        (!dit->no_audio && (!audio_latent || !audio_velocity))) {
         fail(error, error_size, "invalid DiT forward arguments");
         return 0;
     }
+    if (dit->no_audio) return forward_image(dit, step, video_latent,
+                                            video_velocity, error, error_size);
     size_t video_row_elements = (size_t)dit->video_rows * VIDEO_PATCH;
     size_t audio_row_elements = (size_t)dit->audio_rows * AUDIO_CHANNELS;
     float *video_rows = malloc(video_row_elements * sizeof(*video_rows));
@@ -3616,6 +3746,10 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
+    for (int i = 0; i < dit->pdd_steps; i++) {
+        h3_gpu_tensor_free(dit->pdd_w[i]);
+        h3_gpu_tensor_free(dit->pdd_b[i]);
+    }
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
