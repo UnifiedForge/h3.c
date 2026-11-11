@@ -2753,6 +2753,8 @@ h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    h3_image_dump("positions.f64", layout.positions,
+                  layout.seq_len * sizeof(*layout.positions));
     h3_sigma_schedule sigmas;
     memset(&sigmas, 0, sizeof(sigmas));
     sigmas.steps = H3_IMAGE_STEPS;
