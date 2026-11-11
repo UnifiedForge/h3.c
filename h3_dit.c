@@ -82,6 +82,7 @@ struct h3_dit {
     int nax_mlp;
     int int8_mlp;
     int int8_qkv;
+    int lora_merge;  /* accel-lora-merge: LoRA folded into bf16 weights before int8 */
     int int8_attention_out;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
@@ -1459,6 +1460,72 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* accel-lora-merge (H3_LORA_MERGE=1): fold every branch of a site into its
+ * resident bf16 base weight, W[out,in] += B[out,r] * A[r,in] (A already
+ * carries strength * alpha/rank), before the weight is quantized to int8.
+ * Exactly the arithmetic of an offline fused checkpoint, done at load for the
+ * strength in this run. The branch is then dropped, so the denoise loop takes
+ * the no-LoRA fused int8 paths. Only for resident weights: streaming
+ * overwrites the weight buffers every evaluation. */
+static h3_gpu_tensor *merge_scratch;
+static int merge_site(h3_dit *dit, h3_lora_site *site, h3_gpu_tensor *weight,
+                      uint32_t out_dim, uint32_t in_dim, const char *label,
+                      char *error, size_t error_size) {
+    if (!site->count) return 1;
+    size_t elements = (size_t)out_dim * in_dim;
+    if (!merge_scratch) {
+        merge_scratch = h3_gpu_tensor_new_bf16(dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        if (!merge_scratch) {
+            fail(error, error_size, "LoRA merge scratch: %s", h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    for (unsigned index = 0; index < site->count; index++) {
+        h3_lora_branch *branch = &site->branches[index];
+        uint32_t rank = branch->rank;
+        size_t a_elements = (size_t)rank * in_dim;
+        uint16_t *a = malloc(a_elements * sizeof(*a));
+        uint16_t *at = malloc(a_elements * sizeof(*at));
+        if (!a || !at || !h3_gpu_tensor_read_bf16(branch->a, a, a_elements)) {
+            free(a); free(at);
+            fail(error, error_size, "LoRA merge %s: cannot read A", label);
+            return 0;
+        }
+        for (uint32_t r = 0; r < rank; r++)
+            for (uint32_t c = 0; c < in_dim; c++)
+                at[(size_t)c * rank + r] = a[(size_t)r * in_dim + c];
+        h3_gpu_tensor *a_t = h3_gpu_tensor_new_bf16(dit->gpu, a_elements);
+        int ok = a_t && h3_gpu_tensor_write_bf16(a_t, at, a_elements) &&
+            h3_gpu_begin(dit->gpu) &&
+            /* rows = out_dim: delta[o, :] = B[o, :] * A, as a linear whose
+             * weight is A^T laid out [in_dim, rank] */
+            h3_gpu_linear_bf16(dit->gpu, merge_scratch, branch->b, a_t, NULL,
+                               out_dim, rank, in_dim) &&
+            h3_gpu_add_bf16(dit->gpu, weight, weight, merge_scratch, elements) &&
+            h3_gpu_submit(dit->gpu);
+        free(a); free(at);
+        h3_gpu_tensor_free(a_t);
+        if (!ok) {
+            fail(error, error_size, "LoRA merge %s: %s", label, h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    h3_lora_site_free(site);
+    return 1;
+}
+
+static int merge_block_loras(h3_dit *dit, h3_dit_block *block,
+                             char *error, size_t error_size) {
+    return merge_site(dit, &block->lora_qkv, block->qkv, INNER * 3, HIDDEN,
+                      "qkv", error, error_size) &&
+           merge_site(dit, &block->lora_out, block->out, HIDDEN, INNER,
+                      "out", error, error_size) &&
+           merge_site(dit, &block->lora_fc1, block->fc1, FFN * 2, HIDDEN,
+                      "fc1", error, error_size) &&
+           merge_site(dit, &block->lora_fc2, block->fc2, HIDDEN, FFN,
+                      "fc2", error, error_size);
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -1477,6 +1544,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
+            if (dit->lora_merge &&
+                !merge_block_loras(dit, &dit->blocks[index],
+                                   error, error_size)) return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1490,6 +1560,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
+    h3_gpu_tensor_free(merge_scratch);
+    merge_scratch = NULL;
     if (dit->ssd_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
@@ -1897,6 +1969,18 @@ static h3_dit *load_dit(const char *weight_directory,
          * int8. H3_LORA_BF16=1 restores the upstream all-bf16 branch. */
         int lora_int8 = getenv("H3_LORA_BF16") == NULL &&
             (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out);
+        /* accel-lora-merge: every entry ungated and weights resident -> fold
+         * the deltas into the weights at load and keep the fused paths. */
+        const char *merge_env = getenv("H3_LORA_MERGE");
+        int mergeable = merge_env && *merge_env && strcmp(merge_env, "0") &&
+            !dit->ssd_streaming && lora_int8;
+        for (size_t e = 0; mergeable && e < loras->count; e++)
+            if (loras->entries[e].from_sigma > 0.0f) mergeable = 0;
+        if (merge_env && *merge_env && strcmp(merge_env, "0"))
+            fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
+                    mergeable ? "on" : "off (streaming, bf16 path or a time-gated LoRA)");
+        dit->lora_merge = mergeable;
+        if (mergeable) goto lora_flags_done;
         dit->fused_mlp = 0;
         dit->nax_mlp = 0;
         dit->keep_bf16_qkv = 0;
@@ -1911,6 +1995,7 @@ static h3_dit *load_dit(const char *weight_directory,
             dit->int8_qkv = 0;
             dit->int8_attention_out = 0;
         }
+lora_flags_done:
         dit->loras = loras;
         uint64_t max_rank = 0, max_out_dim = 0;
         h3_lora_set_extents(loras, &max_rank, &max_out_dim);

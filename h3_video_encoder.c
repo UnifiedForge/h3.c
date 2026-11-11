@@ -72,6 +72,16 @@ typedef struct {
     encoder_conv quant;
     float latent_mean[LATENT_CHANNELS];
     float latent_std[LATENT_CHANNELS];
+    /* accel: scratch pool. Every residual block used to allocate ~7 fresh
+     * f32 tensors of up to several hundred MiB and free them after its submit,
+     * ~186 GiB of fresh MTLBuffers per 17-frame clip. Freed tensors are kept
+     * by element count and handed out again. Safe because every scratch is
+     * fully overwritten by its producer (pad writes every element, temporal
+     * front included) and every user submits and waits before freeing.
+     * Opt-in while it is measured: H3_ENCODER_POOL=1. */
+    struct { h3_gpu_tensor *tensor; size_t elements; int in_use; } pool[160];
+    int pool_count;
+    int pool_off;
 } encoder_context;
 
 typedef struct {
@@ -113,6 +123,9 @@ static void free_norm(encoder_norm *norm) {
 
 static void cleanup(encoder_context *encoder) {
     if (!encoder) return;
+    for (int index = 0; index < encoder->pool_count; index++)
+        h3_gpu_tensor_free(encoder->pool[index].tensor);
+    encoder->pool_count = 0;
     free_conv(&encoder->conv_in);
     for (int level = 0; level < LEVELS; level++) {
         for (int block = 0; block < BLOCKS; block++) {
@@ -348,6 +361,36 @@ static size_t tensor_elements(uint32_t depth, uint32_t height, uint32_t width,
     return (size_t)depth * height * width * channels;
 }
 
+static h3_gpu_tensor *scratch_new(encoder_context *encoder, size_t elements) {
+    if (!encoder->pool_off) {
+        for (int index = 0; index < encoder->pool_count; index++)
+            if (!encoder->pool[index].in_use &&
+                encoder->pool[index].elements == elements) {
+                encoder->pool[index].in_use = 1;
+                return encoder->pool[index].tensor;
+            }
+    }
+    h3_gpu_tensor *tensor = h3_gpu_tensor_new_f32(encoder->gpu, elements);
+    if (tensor && !encoder->pool_off &&
+        encoder->pool_count < (int)(sizeof(encoder->pool) / sizeof(encoder->pool[0]))) {
+        encoder->pool[encoder->pool_count].tensor = tensor;
+        encoder->pool[encoder->pool_count].elements = elements;
+        encoder->pool[encoder->pool_count].in_use = 1;
+        encoder->pool_count++;
+    }
+    return tensor;
+}
+
+static void scratch_free(encoder_context *encoder, h3_gpu_tensor *tensor) {
+    if (!tensor) return;
+    for (int index = 0; index < encoder->pool_count; index++)
+        if (encoder->pool[index].tensor == tensor) {
+            encoder->pool[index].in_use = 0;
+            return;
+        }
+    h3_gpu_tensor_free(tensor);
+}
+
 static int conv_op(encoder_context *encoder, h3_gpu_tensor *output,
                    const h3_gpu_tensor *input, const encoder_conv *conv,
                    uint32_t depth, uint32_t height, uint32_t width,
@@ -389,11 +432,10 @@ static h3_gpu_tensor *run_conv(encoder_context *encoder,
     h3_gpu_tensor *padded = NULL;
     if (conv->depth_front || conv->height_before || conv->height_after ||
         conv->width_before || conv->width_after)
-        padded = h3_gpu_tensor_new_f32(
-            encoder->gpu, tensor_elements(padded_d, padded_h, padded_w,
+        padded = scratch_new(
+            encoder, tensor_elements(padded_d, padded_h, padded_w,
                                            conv->input_channels));
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(
-        encoder->gpu, tensor_elements(*output_depth, *output_height,
+    h3_gpu_tensor *output = scratch_new(encoder, tensor_elements(*output_depth, *output_height,
                                       *output_width, conv->output_channels));
     int ok = output && (!((conv->depth_front || conv->height_before ||
                            conv->height_after || conv->width_before ||
@@ -408,9 +450,9 @@ static h3_gpu_tensor *run_conv(encoder_context *encoder,
              gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
                     "submit visual encoder convolution");
     }
-    h3_gpu_tensor_free(padded);
+    scratch_free(encoder, padded);
     if (!ok) {
-        h3_gpu_tensor_free(output);
+        scratch_free(encoder, output);
         return NULL;
     }
     return output;
@@ -429,14 +471,14 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                                         input_channels);
     size_t pad2_count = tensor_elements(depth + 2, height + 2, width + 2,
                                         output_channels);
-    h3_gpu_tensor *norm1 = h3_gpu_tensor_new_f32(encoder->gpu, input_count);
-    h3_gpu_tensor *pad1 = h3_gpu_tensor_new_f32(encoder->gpu, pad1_count);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *norm2 = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *pad2 = h3_gpu_tensor_new_f32(encoder->gpu, pad2_count);
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
+    h3_gpu_tensor *norm1 = scratch_new(encoder, input_count);
+    h3_gpu_tensor *pad1 = scratch_new(encoder, pad1_count);
+    h3_gpu_tensor *hidden = scratch_new(encoder, output_count);
+    h3_gpu_tensor *norm2 = scratch_new(encoder, output_count);
+    h3_gpu_tensor *pad2 = scratch_new(encoder, pad2_count);
+    h3_gpu_tensor *output = scratch_new(encoder, output_count);
     h3_gpu_tensor *shortcut = block->has_shortcut ?
-        h3_gpu_tensor_new_f32(encoder->gpu, output_count) : NULL;
+        scratch_new(encoder, output_count) : NULL;
     int ok = norm1 && pad1 && hidden && norm2 && pad2 && output &&
              (!block->has_shortcut || shortcut);
     if (!ok) {
@@ -471,14 +513,14 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                         "submit visual encoder residual block");
 
 done:
-    h3_gpu_tensor_free(norm1);
-    h3_gpu_tensor_free(pad1);
-    h3_gpu_tensor_free(hidden);
-    h3_gpu_tensor_free(norm2);
-    h3_gpu_tensor_free(pad2);
-    h3_gpu_tensor_free(shortcut);
+    scratch_free(encoder, norm1);
+    scratch_free(encoder, pad1);
+    scratch_free(encoder, hidden);
+    scratch_free(encoder, norm2);
+    scratch_free(encoder, pad2);
+    scratch_free(encoder, shortcut);
     if (!ok) {
-        h3_gpu_tensor_free(output);
+        scratch_free(encoder, output);
         return NULL;
     }
     return output;
@@ -547,10 +589,10 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
     size_t hidden_count = tensor_elements(depth, h, w, 1024);
     size_t padded_count = tensor_elements(depth + 2, h + 2, w + 2, 1024);
     size_t moment_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_f32(encoder->gpu, hidden_count);
-    h3_gpu_tensor *padded = h3_gpu_tensor_new_f32(encoder->gpu, padded_count);
-    h3_gpu_tensor *moments = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    h3_gpu_tensor *quant = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
+    h3_gpu_tensor *norm = scratch_new(encoder, hidden_count);
+    h3_gpu_tensor *padded = scratch_new(encoder, padded_count);
+    h3_gpu_tensor *moments = scratch_new(encoder, moment_count);
+    h3_gpu_tensor *quant = scratch_new(encoder, moment_count);
     int ok = norm && padded && moments && quant;
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder output");
@@ -589,10 +631,10 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
                 }
     free(raw);
     free_tensor(&hidden);
-    h3_gpu_tensor_free(norm);
-    h3_gpu_tensor_free(padded);
-    h3_gpu_tensor_free(moments);
-    h3_gpu_tensor_free(quant);
+    scratch_free(encoder, norm);
+    scratch_free(encoder, padded);
+    scratch_free(encoder, moments);
+    scratch_free(encoder, quant);
     if (!ok) {
         free(latent);
         return NULL;
@@ -765,6 +807,8 @@ int h3_video_vae_encode(const char *weight_directory,
         return 0;
     }
     encoder_context encoder = {0};
+    const char *pool_env = getenv("H3_ENCODER_POOL");
+    encoder.pool_off = !(pool_env && *pool_env && strcmp(pool_env, "0"));
     encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (encoder.gpu)
         h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
