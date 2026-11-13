@@ -573,6 +573,9 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = reductions[0] / float(elements);
+    // WAR hazard: reductions[] is reused for the variance below; a fast thread could overwrite reductions[0]
+    // before a slow one read the mean (same fix as antirez/h3.c PR #84 commit 912ecae by Yu Rong).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     local = 0.0f;
     for (uint index = tid; index < elements; index += threadgroup_size.x) {
         uint spatial = index / channels_per_group;
