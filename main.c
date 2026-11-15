@@ -67,6 +67,10 @@ static void usage(const char *program) {
         "                         and --frames into a latent file, then exit\n"
         "      --sampler NAME     euler (default) or renoise: x0 re-noised with fresh\n"
         "                         noise each step (Pika H3 Flex; use with --sigmas)\n"
+        "      --image-model DIR  MiniMax-H3-Image (6 steps): text-to-image, or\n"
+        "                         editing with up to 16 --ref-image (Picture 1..N in\n"
+        "                         order); writes the image latent to --save-latent\n"
+        "      --noise-file PATH  Image: start from this raw F32 noise latent\n"
         "      --no-video-decode  Skip the video VAE decode (use with --save-latent);\n"
         "                         -o receives only the soundtrack as WAV\n"
         "      --lora PATH[:STRENGTH[@SIGMA]]  Apply a LoRA adapter (default 1.0;\n"
@@ -140,10 +144,15 @@ static void parse_lora(char *argument, h3_lora *lora) {
     }
 }
 
-static h3_reference *append_reference(h3_reference references[12],
-                                      size_t *count) {
-    if (*count >= 12) {
-        fprintf(stderr, "h3: Ref2VA supports at most 12 references\n");
+/* h3image: the image model edits with up to 16 references; Ref2VA keeps its
+ * limit of 12, checked once the whole command line is known. */
+#define H3_CLI_MAX_REFERENCES 16
+
+static h3_reference *append_reference(
+        h3_reference references[H3_CLI_MAX_REFERENCES], size_t *count) {
+    if (*count >= H3_CLI_MAX_REFERENCES) {
+        fprintf(stderr, "h3: at most %d references (12 for Ref2VA)\n",
+                H3_CLI_MAX_REFERENCES);
         exit(2);
     }
     h3_reference *reference = &references[(*count)++];
@@ -300,7 +309,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_LORA, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE, OPT_SAMPLER, OPT_HISTORY_VIDEO };
+           OPT_RESUME, OPT_PROFILE, OPT_INFO, OPT_GUIDE_VIDEO, OPT_INIT_VIDEO, OPT_SIGMAS, OPT_INIT_LATENT, OPT_SAVE_LATENT, OPT_ENCODE_LATENT, OPT_NO_VIDEO_DECODE, OPT_SAMPLER, OPT_HISTORY_VIDEO, OPT_IMAGE_MODEL, OPT_NOISE_FILE };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -358,6 +367,8 @@ int main(int argc, char **argv) {
         {"save-latent", required_argument, NULL, OPT_SAVE_LATENT},
         {"encode-latent", required_argument, NULL, OPT_ENCODE_LATENT},
         {"no-video-decode", no_argument, NULL, OPT_NO_VIDEO_DECODE},
+        {"image-model", required_argument, NULL, OPT_IMAGE_MODEL},
+        {"noise-file", required_argument, NULL, OPT_NOISE_FILE},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
@@ -372,7 +383,7 @@ int main(int argc, char **argv) {
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
     const char *encode_latent_out = NULL;
-    h3_reference references[12];
+    h3_reference references[H3_CLI_MAX_REFERENCES];
     size_t reference_count = 0;
     /* No static cap on adapters (G4): at most one per argv slot. */
     h3_lora *loras = calloc((size_t)argc, sizeof(*loras));
@@ -528,6 +539,8 @@ int main(int argc, char **argv) {
             case OPT_SAVE_LATENT: params.save_latent = optarg; break;
             case OPT_ENCODE_LATENT: encode_latent_out = optarg; break;
             case OPT_NO_VIDEO_DECODE: params.skip_video_decode = 1; break;
+            case OPT_IMAGE_MODEL: params.image_model = optarg; break;
+            case OPT_NOISE_FILE: params.noise_file = optarg; break;
             case OPT_SAMPLER:
                 if (!strcmp(optarg, "renoise")) params.sampler_renoise = 1;
                 else if (!strcmp(optarg, "euler")) params.sampler_renoise = 0;
@@ -563,6 +576,10 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "h3: warning: --reuse with only %d denoising steps leaves very "
             "few fresh model evaluations\n", params.steps);
+    }
+    if (!params.image_model && reference_count > 12) {
+        fprintf(stderr, "h3: Ref2VA supports at most 12 references\n");
+        return 2;
     }
     params.references = references;
     params.reference_count = reference_count;
@@ -605,7 +622,9 @@ int main(int argc, char **argv) {
                 params.preview_denoise = 1;
             }
         }
-        h3_result *result = h3_generate(ctx, prompt, &params);
+        h3_result *result = params.image_model ?
+            h3_generate_image(ctx, prompt, &params) :
+            h3_generate(ctx, prompt, &params);
         if (!result) {
             if (cli.active) fputc('\n', stderr);
             fprintf(stderr, "h3: %s\n", h3_last_error(ctx));
@@ -613,7 +632,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         h3_result_free(result);
-        if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
+        if (output && *output && !params.image_model)
+            fprintf(stderr, "h3: wrote %s\n", output);
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
     } else if (!info) {

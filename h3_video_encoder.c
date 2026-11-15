@@ -73,6 +73,9 @@ typedef struct {
     encoder_conv quant;
     float latent_mean[LATENT_CHANNELS];
     float latent_std[LATENT_CHANNELS];
+    /* h3image: keep the raw posterior moments (mean and log-variance, 48
+     * channels, not normalized) instead of the normalized posterior mean. */
+    int moments;
     /* accel: scratch pool. Every residual block used to allocate ~7 fresh
      * f32 tensors of up to several hundred MiB and free them after its submit,
      * ~186 GiB of fresh MTLBuffers per 17-frame clip. Freed tensors are kept
@@ -640,14 +643,15 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
                     "submit visual encoder output");
     }
     float *raw = ok ? malloc(moment_count * sizeof(*raw)) : NULL;
-    size_t latent_count = (size_t)LATENT_CHANNELS * depth * h * w;
+    uint32_t out_channels = encoder->moments ? MOMENT_CHANNELS : LATENT_CHANNELS;
+    size_t latent_count = (size_t)out_channels * depth * h * w;
     float *latent = ok ? malloc(latent_count * sizeof(*latent)) : NULL;
     if (ok && (!raw || !latent ||
                !h3_gpu_tensor_read_f32(quant, raw, moment_count))) {
         fail(error, error_size, "cannot read visual encoder latent");
         ok = 0;
     }
-    if (ok) for (uint32_t channel = 0; channel < LATENT_CHANNELS; channel++)
+    if (ok) for (uint32_t channel = 0; channel < out_channels; channel++)
         for (uint32_t time = 0; time < depth; time++)
             for (uint32_t y = 0; y < h; y++)
                 for (uint32_t x = 0; x < w; x++) {
@@ -655,8 +659,9 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
                                     MOMENT_CHANNELS + channel;
                     size_t target = (((size_t)channel * depth + time) * h + y) *
                                     w + x;
-                    latent[target] = (raw[source] - encoder->latent_mean[channel]) /
-                                     encoder->latent_std[channel];
+                    latent[target] = encoder->moments ? raw[source] :
+                        (raw[source] - encoder->latent_mean[channel]) /
+                        encoder->latent_std[channel];
                 }
     free(raw);
     scratch_free(encoder, hidden); hidden = NULL;
@@ -749,7 +754,7 @@ static float *extract_pixel_tile(const float *pixels, int frames,
     return tile;
 }
 
-static int stitch_latents(float **tiles, int latent_time,
+static int stitch_latents(float **tiles, int channels, int latent_time,
                           const tile_axis *y_axis, const tile_axis *x_axis,
                           h3_video_latent *output, char *error,
                           size_t error_size) {
@@ -759,7 +764,7 @@ static int stitch_latents(float **tiles, int latent_time,
                  SPATIAL_RATIO;
     int full_w = (x_axis->starts[x_axis->count - 1] + x_axis->length) /
                  SPATIAL_RATIO;
-    size_t count = (size_t)LATENT_CHANNELS * latent_time * full_h * full_w;
+    size_t count = (size_t)channels * latent_time * full_h * full_w;
     float *values = malloc(count * sizeof(*values));
     if (!values) {
         fail(error, error_size, "out of memory stitching visual latents");
@@ -781,7 +786,7 @@ static int stitch_latents(float **tiles, int latent_time,
                 x_axis->overlaps[tile_x] / SPATIAL_RATIO : 0);
             int destination_y = y_axis->starts[tile_y] / SPATIAL_RATIO;
             int destination_x = x_axis->starts[tile_x] / SPATIAL_RATIO;
-            for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+            for (int channel = 0; channel < channels; channel++)
                 for (int time = 0; time < latent_time; time++)
                     for (int y = 0; y < keep_h; y++)
                         for (int x = 0; x < keep_w; x++) {
@@ -818,9 +823,10 @@ static int stitch_latents(float **tiles, int latent_time,
     return 1;
 }
 
-int h3_video_vae_encode(const char *weight_directory,
+static int encode_common(const char *weight_directory,
                         const char *shader_source_path,
                         const float *pixels, int frames, int height, int width,
+                        int moments, const float *posterior_noise,
                         h3_video_encoder_progress progress, void *progress_opaque,
                         h3_video_latent *output,
                         char *error, size_t error_size) {
@@ -841,6 +847,7 @@ int h3_video_vae_encode(const char *weight_directory,
         return 0;
     }
     encoder_context encoder = {0};
+    encoder.moments = moments;
     /* accel: scratch buffer pool is on by default (byte-identical output);
      * H3_ENCODER_POOL=0 turns it off. */
     const char *pool_env = getenv("H3_ENCODER_POOL");
@@ -894,9 +901,31 @@ int h3_video_vae_encode(const char *weight_directory,
                 (double)timing_ts.tv_sec + (double)timing_ts.tv_nsec * 1e-9 -
                 timing_loaded);
     }
-    if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
+    if (ok) ok = stitch_latents(tiles, moments ? MOMENT_CHANNELS :
+                                LATENT_CHANNELS, latent_time, &y_axis, &x_axis,
                                 output, error, error_size) &&
                  h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
+    if (ok && moments) {
+        /* The stitched tensor is [48,T,H,W]: blended mean then blended
+         * log-variance, as the reference blends the moments before it draws.
+         * z = mean + exp(0.5 * clamp(logvar, -30, 20)) * noise, rounded to
+         * float16 (the released recipe), then normalized, in place over the
+         * first 24 channels. */
+        size_t plane = (size_t)latent_time * output->height * output->width;
+        for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+            for (size_t index = 0; index < plane; index++) {
+                size_t at = (size_t)channel * plane + index;
+                float mean = output->values[at];
+                float logvar = output->values[at + LATENT_CHANNELS * plane];
+                if (logvar < -30.0f) logvar = -30.0f;
+                if (logvar > 20.0f) logvar = 20.0f;
+                float value = posterior_noise ?
+                    mean + expf(0.5f * logvar) * posterior_noise[at] : mean;
+                value = (float)(_Float16)value;
+                output->values[at] = (value - encoder.latent_mean[channel]) /
+                                     encoder.latent_std[channel];
+            }
+    }
     if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
     cleanup(&encoder);
@@ -904,6 +933,30 @@ int h3_video_vae_encode(const char *weight_directory,
     tile_axis_free(&x_axis);
     if (!ok) h3_video_latent_free(output);
     return ok;
+}
+
+int h3_video_vae_encode(const char *weight_directory,
+                        const char *shader_source_path,
+                        const float *pixels, int frames, int height, int width,
+                        h3_video_encoder_progress progress, void *progress_opaque,
+                        h3_video_latent *output,
+                        char *error, size_t error_size) {
+    return encode_common(weight_directory, shader_source_path, pixels, frames,
+                         height, width, 0, NULL, progress, progress_opaque,
+                         output, error, error_size);
+}
+
+int h3_video_vae_encode_image_sampled(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const float *pixels, int height, int width,
+                        const float *posterior_noise,
+                        h3_video_encoder_progress progress, void *progress_opaque,
+                        h3_video_latent *output,
+                        char *error, size_t error_size) {
+    return encode_common(weight_directory, shader_source_path, pixels, 1,
+                         height, width, 1, posterior_noise, progress,
+                         progress_opaque, output, error, error_size);
 }
 
 void h3_video_latent_free(h3_video_latent *latent) {

@@ -240,6 +240,74 @@ cleanup:
     return ok;
 }
 
+/* h3image: the MiniMax-H3-Image edit presentation. Per reference a
+ * `Picture i: ` label (no angle brackets, unlike H3 video) and one vision
+ * block, then the prompt verbatim, truncated to max_prompt_tokens. */
+int h3_multimodal_encode_image_edit_bf16(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt, size_t max_prompt_tokens,
+                        const h3_vision_output *images, size_t image_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        uint32_t **ids_out, size_t *id_count_out,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (output) memset(output, 0, sizeof(*output));
+    if (ids_out) *ids_out = NULL;
+    if (id_count_out) *id_count_out = 0;
+    if (!tokenizer || !weight_directory || !shader_source_path || !prompt ||
+        !*prompt || !images || !image_count || !output) {
+        fail(error, error_size, "invalid image edit presentation arguments");
+        return 0;
+    }
+    h3_ids ids = {0};
+    h3_text_vision_span *spans = calloc(image_count, sizeof(*spans));
+    const h3_vision_output **visions = calloc(image_count, sizeof(*visions));
+    int ok = 0;
+    if (!spans || !visions) {
+        fail(error, error_size,
+             "out of memory constructing image edit presentation");
+        goto cleanup;
+    }
+    for (size_t image = 0; image < image_count; image++) {
+        char prefix[64];
+        int length = snprintf(prefix, sizeof(prefix), "Picture %zu: ", image + 1);
+        visions[image] = &images[image];
+        if (length < 0 || (size_t)length >= sizeof(prefix) ||
+            !tokenize_append(tokenizer, prefix, &ids, error, error_size) ||
+            !append_vision(&ids, &spans[image], &images[image], H3_IMAGE_PAD,
+                           error, error_size)) {
+            if (error && error_size && !*error)
+                fail(error, error_size,
+                     "cannot construct image edit presentation");
+            goto cleanup;
+        }
+    }
+    size_t before_prompt = ids.count;
+    if (!tokenize_append(tokenizer, prompt, &ids, error, error_size))
+        goto cleanup;
+    if (max_prompt_tokens && ids.count - before_prompt > max_prompt_tokens) {
+        fprintf(stderr, "h3: prompt truncated from %zu to %zu tokens\n",
+                ids.count - before_prompt, max_prompt_tokens);
+        ids.count = before_prompt + max_prompt_tokens;
+    }
+    ok = encode_presentation(weight_directory, shader_source_path,
+        &ids, spans, visions, image_count, progress, progress_opaque,
+        output, error, error_size);
+    if (ok && ids_out && id_count_out) {
+        *ids_out = ids.values;
+        *id_count_out = ids.count;
+        ids.values = NULL;
+    }
+cleanup:
+    free(ids.values);
+    free(spans);
+    free(visions);
+    return ok;
+}
+
 int h3_multimodal_encode_ref2va_bf16(
                         const h3_tokenizer *tokenizer,
                         const char *weight_directory,

@@ -102,6 +102,13 @@ int h3_dit_set_resume(h3_dit *dit, const char *path, const char *key,
                       const h3_resume_state *state);
 
 size_t h3_dit_video_elements(const h3_dit *dit);
+
+/* h3image: load MiniMax-H3-Image per-step output heads (PDD,
+ * pdd_fused_heads.safetensors: video_out.weight [steps,96,5376] and
+ * video_out.bias [steps,96], F32). Step i of the schedule then projects with
+ * head i. The step count must equal the schedule's. */
+int h3_dit_load_step_heads(h3_dit *dit, const char *path,
+                           char *error, size_t error_size);
 size_t h3_dit_audio_elements(const h3_dit *dit);
 
 /* Arm gate 2 of the G4 guardrail with the ceiling taken before the load. It
@@ -111,7 +118,8 @@ size_t h3_dit_audio_elements(const h3_dit *dit);
 void h3_dit_arm_memory_gate(h3_dit *dit, const h3_memory_ceiling *ceiling);
 
 /* One raw data-ward velocity evaluation. Input/output video layout is
- * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
+ * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. An audio-free
+ * (image) layout takes NULL audio pointers. */
 int h3_dit_forward(h3_dit *dit, int step,
                    const float *video_latent, const float *audio_latent,
                    float *video_velocity, float *audio_velocity,

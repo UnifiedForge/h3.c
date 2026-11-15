@@ -178,6 +178,12 @@ typedef struct {
     /* 0 = Euler (default); 1 = renoise: x0 = x + sigma*v, re-noised to the
      * next sigma with fresh noise (Pika H3 Flex's sampler). */
     int sampler_renoise;
+    /* h3image: MiniMax-H3-Image checkpoint directory. Set, h3_generate_image
+     * runs text-to-image there (text encoder and tokenizer stay in model_dir). */
+    const char *image_model;
+    /* h3image: start from this noise (raw little-endian F32, the latent
+     * [24,1,H/16,W/16] channel-major) instead of the seeded draw. */
+    const char *noise_file;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
@@ -242,6 +248,10 @@ void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);
+/* h3image: MiniMax-H3-Image text-to-image (params->image_model). Writes the
+ * final image latent to params->save_latent; decoding is separate. */
+h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
+                             const h3_params *params);
 void h3_result_free(h3_result *result);
 
 #ifdef __cplusplus
