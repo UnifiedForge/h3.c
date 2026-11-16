@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 enum {
     TIME_INPUT = 256,
@@ -78,7 +82,7 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 static int prepare_rows(h3_dit_schedule *schedule,
                         const h3_sigma_schedule *sigmas,
                         int visual_condition, int audio_condition,
-                        float **features_out, char *error,
+                        float **features_out, float **times_out, char *error,
                         size_t error_size) {
     schedule->steps = sigmas->steps;
     schedule->video_rows = calloc((size_t)sigmas->steps,
@@ -155,8 +159,8 @@ static int prepare_rows(h3_dit_schedule *schedule,
                 sinf(angle);
         }
     }
-    free(times);
     *features_out = features;
+    *times_out = times;
     return 1;
 }
 
@@ -281,6 +285,296 @@ static int adaln_lora_dispatch(h3_gpu *gpu, const h3_lora_site *site,
                                    error_size);
 }
 
+/* quant: AdaLN table cache.
+ *
+ * The table is a pure function of the AdaLN weights and of the timestep rows,
+ * so it can be stored once and read back instead of streaming the 24 GiB of
+ * adaln_proj weights at every load. One file per row set:
+ *   <component>/adaln_cache/adaln-<key>.safetensors
+ * where <component> is the parent of the transformer directory and <key>
+ * hashes the exact float bits of the timestep rows (in row order) plus a
+ * fingerprint of the weights. A hit is the very table the same rows produced
+ * on the GPU, so the run is byte-identical. LoRA AdaLN pairs are still added
+ * on top at load, exactly as before, from the time embedding alone.
+ *
+ * Files are read whenever present. They are written only if the adaln_cache
+ * directory already exists (created by the quantize script), so new sigma sets
+ * never fill the disk silently. H3_ADALN_CACHE=0 disables the cache,
+ * H3_ADALN_CACHE_DIR overrides the directory. */
+
+#define ADALN_CACHE_VERSION "1"
+
+static uint64_t fnv64(uint64_t hash, const void *data, size_t bytes) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < bytes; i++) {
+        hash ^= p[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+/* Fingerprint of everything the table depends on besides the rows: shapes
+ * and the first/last 64 KiB of the time embedder and AdaLN tensors. Cheap,
+ * and independent of paths and mtimes, so a copy on another Mac still hits. */
+static int adaln_fingerprint(const h3_weight_store *weights, uint64_t *out) {
+    static const char *names[] = {
+        "time_embedder.proj_in.weight", "time_embedder.proj_out.weight",
+        "blocks.0.adaln_proj.linear.weight", "blocks.0.adaln_proj.linear.bias",
+        "blocks.25.adaln_proj.linear.weight",
+        "blocks.49.adaln_proj.linear.weight",
+        "blocks.49.adaln_proj.linear.bias",
+        "final_layer.adaln_proj.linear.weight",
+        "final_layer.adaln_proj.linear.bias"
+    };
+    enum { SAMPLE = 64 * 1024 };
+    unsigned char *buffer = malloc(SAMPLE);
+    if (!buffer) return 0;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    hash = fnv64(hash, ADALN_CACHE_VERSION, 1);
+    int ok = 1;
+    for (size_t i = 0; ok && i < sizeof(names) / sizeof(*names); i++) {
+        const h3_st_header *header = NULL;
+        const h3_st_tensor *tensor = h3_weight_find(weights, names[i], &header);
+        if (!tensor || !header) { ok = 0; break; }
+        hash = fnv64(hash, names[i], strlen(names[i]));
+        hash = fnv64(hash, &tensor->dtype, sizeof(tensor->dtype));
+        hash = fnv64(hash, tensor->shape, sizeof(tensor->shape[0]) *
+                                          (size_t)tensor->ndim);
+        uint64_t size = tensor->data_end - tensor->data_begin;
+        int fd = open(header->path, O_RDONLY);
+        if (fd < 0) { ok = 0; break; }
+        uint64_t take = size < SAMPLE ? size : SAMPLE;
+        uint64_t offsets[2] = {tensor->file_offset,
+                               tensor->file_offset + size - take};
+        for (int which = 0; ok && which < 2; which++) {
+            ssize_t got = pread(fd, buffer, (size_t)take, (off_t)offsets[which]);
+            if (got != (ssize_t)take) ok = 0;
+            else hash = fnv64(hash, buffer, (size_t)take);
+        }
+        close(fd);
+    }
+    free(buffer);
+    *out = hash;
+    return ok;
+}
+
+static int adaln_cache_disabled(void) {
+    const char *value = getenv("H3_ADALN_CACHE");
+    return value && !strcmp(value, "0");
+}
+
+/* <component>/adaln_cache, derived from the shard holding blocks.0. */
+static int adaln_cache_dir(const h3_weight_store *weights, char *out,
+                           size_t out_size) {
+    const char *override = getenv("H3_ADALN_CACHE_DIR");
+    if (override && *override) {
+        return snprintf(out, out_size, "%s", override) < (int)out_size;
+    }
+    const h3_st_header *header = NULL;
+    if (!h3_weight_find(weights, "blocks.0.adaln_proj.linear.weight", &header) ||
+        !header || !header->path) return 0;
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s", header->path) >= (int)sizeof(path))
+        return 0;
+    for (int strip = 0; strip < 2; strip++) {
+        char *slash = strrchr(path, '/');
+        if (!slash) return 0;
+        *slash = '\0';
+    }
+    return snprintf(out, out_size, "%s/adaln_cache", path) < (int)out_size;
+}
+
+typedef struct {
+    char path[4200];
+    char source[64];
+    int usable;
+} adaln_cache_key;
+
+static void adaln_cache_key_make(const h3_weight_store *weights,
+                                 const float *times, uint32_t rows,
+                                 adaln_cache_key *key) {
+    memset(key, 0, sizeof(*key));
+    if (adaln_cache_disabled()) return;
+    char directory[4096];
+    uint64_t fingerprint = 0;
+    if (!adaln_cache_dir(weights, directory, sizeof(directory)) ||
+        !adaln_fingerprint(weights, &fingerprint)) return;
+    uint64_t hash = fnv64(fingerprint, &rows, sizeof(rows));
+    hash = fnv64(hash, times, (size_t)rows * sizeof(*times));
+    snprintf(key->source, sizeof(key->source), "%016llx",
+             (unsigned long long)fingerprint);
+    if (snprintf(key->path, sizeof(key->path),
+                 "%s/adaln-%016llx.safetensors", directory,
+                 (unsigned long long)hash) >= (int)sizeof(key->path)) return;
+    key->usable = 1;
+}
+
+/* Fills blocks[] and *final from the cache file. All-or-nothing: on any
+ * mismatch everything loaded is freed and the caller recomputes. */
+static int adaln_cache_load(const adaln_cache_key *key, h3_gpu *gpu,
+                            const float *times, uint32_t rows,
+                            h3_gpu_tensor **blocks, h3_gpu_tensor **final) {
+    if (!key->usable) return 0;
+    struct stat info;
+    if (stat(key->path, &info) != 0) return 0;
+    h3_st_header header;
+    char error[256];
+    if (!h3_st_read_header(key->path, &header, error, sizeof(error))) {
+        fprintf(stderr, "h3: AdaLN cache %s unreadable: %s\n", key->path, error);
+        return 0;
+    }
+    int ok = 0;
+    float *stored = NULL;
+    const char *kind = h3_st_metadata(&header, "h3_quant");
+    const char *version = h3_st_metadata(&header, "h3_adaln_version");
+    const char *source = h3_st_metadata(&header, "source");
+    const h3_st_tensor *t = h3_st_find(&header, "t");
+    if (!kind || strcmp(kind, "adaln-table") || !version ||
+        strcmp(version, ADALN_CACHE_VERSION) || !source ||
+        strcmp(source, key->source) || !t || t->dtype != H3_DTYPE_F32 ||
+        h3_st_tensor_elements(t) != rows) goto done;
+    stored = malloc((size_t)rows * sizeof(*stored));
+    if (!stored || !h3_st_read_data(&header, t, stored,
+                                    (size_t)rows * sizeof(*stored),
+                                    error, sizeof(error)) ||
+        memcmp(stored, times, (size_t)rows * sizeof(*stored))) goto done;
+    for (unsigned block = 0; block <= H3_DIT_BLOCKS; block++) {
+        char name[32];
+        uint64_t width = block < H3_DIT_BLOCKS ? BLOCK_OUTPUT : FINAL_OUTPUT;
+        if (block < H3_DIT_BLOCKS) snprintf(name, sizeof(name), "blocks.%u", block);
+        else snprintf(name, sizeof(name), "final");
+        const h3_st_tensor *tensor = h3_st_find(&header, name);
+        if (!tensor || tensor->dtype != H3_DTYPE_BF16 ||
+            h3_st_tensor_elements(tensor) != (uint64_t)rows * width) goto done;
+        h3_gpu_tensor *loaded = h3_gpu_tensor_load_bf16(
+            gpu, key->path, tensor->file_offset, (size_t)rows * width);
+        if (!loaded) goto done;
+        if (block < H3_DIT_BLOCKS) blocks[block] = loaded;
+        else *final = loaded;
+    }
+    ok = 1;
+done:
+    if (!ok) {
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+            free_tensor(&blocks[block]);
+        free_tensor(final);
+    }
+    free(stored);
+    h3_st_free_header(&header);
+    return ok;
+}
+
+/* Streams the table to <path>.tmp as it is computed, renamed on success.
+ * Data order: blocks.0..49, final, t. */
+typedef struct {
+    FILE *file;
+    char temporary[4300];
+    const adaln_cache_key *key;
+    uint16_t *host;
+    int failed;
+} adaln_cache_writer;
+
+static void adaln_cache_writer_open(adaln_cache_writer *writer,
+                                    const adaln_cache_key *key,
+                                    uint32_t rows) {
+    memset(writer, 0, sizeof(*writer));
+    writer->key = key;
+    if (!key->usable) return;
+    char directory[4200];
+    snprintf(directory, sizeof(directory), "%s", key->path);
+    char *slash = strrchr(directory, '/');
+    struct stat info;
+    if (!slash) return;
+    *slash = '\0';
+    if (stat(directory, &info) != 0 || !S_ISDIR(info.st_mode)) return;
+    size_t header_cap = 64 * 1024;
+    char *json = malloc(header_cap);
+    writer->host = malloc((size_t)rows * BLOCK_OUTPUT * sizeof(uint16_t));
+    if (!json || !writer->host) {
+        free(json);
+        free(writer->host);
+        writer->host = NULL;
+        return;
+    }
+    size_t used = (size_t)snprintf(json, header_cap,
+        "{\"__metadata__\":{\"h3_quant\":\"adaln-table\","
+        "\"h3_adaln_version\":\"" ADALN_CACHE_VERSION "\","
+        "\"source\":\"%s\"}", key->source);
+    uint64_t offset = 0;
+    for (unsigned block = 0; block <= H3_DIT_BLOCKS + 1; block++) {
+        char name[32];
+        uint64_t width = block < H3_DIT_BLOCKS ? BLOCK_OUTPUT : FINAL_OUTPUT;
+        const char *dtype = "BF16";
+        uint64_t bytes = (uint64_t)rows * width * 2;
+        if (block < H3_DIT_BLOCKS) {
+            snprintf(name, sizeof(name), "blocks.%u", block);
+            used += (size_t)snprintf(json + used, header_cap - used,
+                ",\"%s\":{\"dtype\":\"%s\",\"shape\":[%u,%llu],"
+                "\"data_offsets\":[%llu,%llu]}", name, dtype, rows,
+                (unsigned long long)width, (unsigned long long)offset,
+                (unsigned long long)(offset + bytes));
+        } else if (block == H3_DIT_BLOCKS) {
+            used += (size_t)snprintf(json + used, header_cap - used,
+                ",\"final\":{\"dtype\":\"BF16\",\"shape\":[%u,%u],"
+                "\"data_offsets\":[%llu,%llu]}", rows, (unsigned)FINAL_OUTPUT,
+                (unsigned long long)offset,
+                (unsigned long long)(offset + bytes));
+        } else {
+            bytes = (uint64_t)rows * 4;
+            used += (size_t)snprintf(json + used, header_cap - used,
+                ",\"t\":{\"dtype\":\"F32\",\"shape\":[%u],"
+                "\"data_offsets\":[%llu,%llu]}", rows,
+                (unsigned long long)offset,
+                (unsigned long long)(offset + bytes));
+        }
+        offset += bytes;
+    }
+    used += (size_t)snprintf(json + used, header_cap - used, "}");
+    while (used % 8) json[used++] = ' ';
+    snprintf(writer->temporary, sizeof(writer->temporary), "%s.tmp.%d",
+             key->path, (int)getpid());
+    writer->file = fopen(writer->temporary, "wb");
+    uint64_t header_size = used;
+    if (!writer->file ||
+        fwrite(&header_size, sizeof(header_size), 1, writer->file) != 1 ||
+        fwrite(json, 1, used, writer->file) != used) {
+        writer->failed = 1;
+    }
+    free(json);
+}
+
+static void adaln_cache_writer_tensor(adaln_cache_writer *writer,
+                                      const h3_gpu_tensor *tensor,
+                                      size_t elements) {
+    if (!writer->file || writer->failed) return;
+    if (!h3_gpu_tensor_read_bf16(tensor, writer->host, elements) ||
+        fwrite(writer->host, sizeof(uint16_t), elements, writer->file) !=
+            elements) writer->failed = 1;
+}
+
+static void adaln_cache_writer_close(adaln_cache_writer *writer,
+                                     const float *times, uint32_t rows,
+                                     int success) {
+    if (writer->file) {
+        if (success && !writer->failed &&
+            fwrite(times, sizeof(*times), rows, writer->file) != rows)
+            writer->failed = 1;
+        if (fclose(writer->file) != 0) writer->failed = 1;
+        if (success && !writer->failed &&
+            rename(writer->temporary, writer->key->path) == 0) {
+            fprintf(stderr, "h3: AdaLN table stored %s\n", writer->key->path);
+        } else {
+            if (success)
+                fprintf(stderr, "h3: AdaLN table not stored (%s)\n",
+                        strerror(errno));
+            unlink(writer->temporary);
+        }
+    }
+    free(writer->host);
+    writer->host = NULL;
+    writer->file = NULL;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
@@ -301,13 +595,30 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     schedule->gpu = gpu;
     adaln_lora_scratch scratch = {NULL, NULL};
     float *features = NULL;
+    float *times = NULL;
+    adaln_cache_key cache_key;
+    adaln_cache_writer cache_writer;
+    memset(&cache_key, 0, sizeof(cache_key));
+    memset(&cache_writer, 0, sizeof(cache_writer));
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
-                      &features, error, error_size)) goto failed;
+                      &features, &times, error, error_size)) goto failed;
     h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
                                            features, error, error_size);
     free(features);
     features = NULL;
     if (!time) goto failed;
+
+    adaln_cache_key_make(weights, times, schedule->time_rows, &cache_key);
+    int cache_hit = adaln_cache_load(&cache_key, gpu, times,
+                                     schedule->time_rows, schedule->blocks,
+                                     &schedule->final);
+    if (cache_key.usable)
+        fprintf(stderr, "h3: AdaLN table cache %s (%u rows)\n",
+                cache_hit ? "hit, adaln_proj weights not read" : "miss",
+                schedule->time_rows);
+    if (!cache_hit)
+        adaln_cache_writer_open(&cache_writer, &cache_key,
+                                schedule->time_rows);
 
     uint64_t lora_rank = adaln_lora_rank(loras);
     if (lora_rank) {
@@ -330,6 +641,32 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                  "blocks.%u.adaln_proj.linear.weight", block);
         snprintf(bias_name, sizeof(bias_name),
                  "blocks.%u.adaln_proj.linear.bias", block);
+        if (cache_hit) {
+            /* The stored table is the base projection; only the LoRA delta,
+             * if any, is added on top, exactly as after the linear below. */
+            snprintf(operation, sizeof(operation), "AdaLN block %u", block);
+            char pair_name[128];
+            snprintf(pair_name, sizeof(pair_name),
+                     "blocks.%u.adaln_proj.linear", block);
+            h3_lora_site site;
+            int ok = h3_lora_site_build(loras, gpu, pair_name, &site,
+                                        error, error_size) &&
+                (!lora_rank || (
+                gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
+                adaln_lora_dispatch(gpu, &site, &scratch,
+                    schedule->blocks[block], time, schedule->time_rows,
+                    BLOCK_OUTPUT, error, error_size) &&
+                gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                       operation)));
+            h3_lora_site_free(&site);
+            if (!ok) {
+                h3_gpu_tensor_free(time);
+                goto failed;
+            }
+            if (progress) progress((int)block + 1, (int)H3_DIT_BLOCKS,
+                                   progress_opaque);
+            continue;
+        }
         h3_gpu_tensor *weight = weight_bf16_2d(
             weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
             error, error_size);
@@ -358,6 +695,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
                 error, error_size, operation) &&
+            (!cache_writer.file || (
+             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation) &&
+             (adaln_cache_writer_tensor(&cache_writer,
+                  schedule->blocks[block],
+                  (size_t)schedule->time_rows * BLOCK_OUTPUT), 1) &&
+             gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+                    operation))) &&
             adaln_lora_dispatch(gpu, &site, &scratch,
                 schedule->blocks[block], time, schedule->time_rows,
                 BLOCK_OUTPUT, error, error_size) &&
@@ -373,10 +717,31 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                                progress_opaque);
     }
 
-    h3_gpu_tensor *final_w = weight_bf16_2d(
+    h3_gpu_tensor *final_w = NULL, *final_b = NULL;
+    if (cache_hit) {
+        h3_lora_site cached_site = {NULL, 0};
+        int cached_ok = h3_lora_site_build(
+                loras, gpu, "final_layer.adaln_proj.linear", &cached_site,
+                error, error_size) &&
+            (!lora_rank || (
+            gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+                   "begin final AdaLN") &&
+            adaln_lora_dispatch(gpu, &cached_site, &scratch, schedule->final,
+                                time, schedule->time_rows, FINAL_OUTPUT,
+                                error, error_size) &&
+            gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                   "submit final AdaLN")));
+        h3_lora_site_free(&cached_site);
+        if (!cached_ok) {
+            h3_gpu_tensor_free(time);
+            goto failed;
+        }
+        goto finished;
+    }
+    final_w = weight_bf16_2d(
         weights, gpu, "final_layer.adaln_proj.linear.weight",
         FINAL_OUTPUT, H3_DIT_TIME_DIM, error, error_size);
-    h3_gpu_tensor *final_b = weight_bf16_1d(
+    final_b = weight_bf16_1d(
         weights, gpu, "final_layer.adaln_proj.linear.bias",
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
@@ -395,6 +760,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
             H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") &&
+        (!cache_writer.file || (
+         gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                "submit final AdaLN") &&
+         (adaln_cache_writer_tensor(&cache_writer, schedule->final,
+              (size_t)schedule->time_rows * FINAL_OUTPUT), 1) &&
+         gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+                "begin final AdaLN LoRA"))) &&
         adaln_lora_dispatch(gpu, &final_site, &scratch, schedule->final, time,
                             schedule->time_rows, FINAL_OUTPUT,
                             error, error_size) &&
@@ -412,11 +784,17 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     free_tensor(&final_w);
     free_tensor(&final_b);
+    adaln_cache_writer_close(&cache_writer, times, schedule->time_rows, 1);
+finished:
     free_adaln_scratch(&scratch);
     h3_gpu_tensor_free(time);
+    free(times);
     return schedule;
 
 failed:
+    adaln_cache_writer_close(&cache_writer, times, schedule ?
+                             schedule->time_rows : 0, 0);
+    free(times);
     free(features);
     free_adaln_scratch(&scratch);
     h3_dit_schedule_free(schedule);
