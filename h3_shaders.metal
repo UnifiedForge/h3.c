@@ -1401,6 +1401,7 @@ struct int4_expand_args {
     uint rows;
     uint columns;
     uint group;
+    uint has_zero;  /* 1: per-group zero point in gzero (asymmetric) */
 };
 
 kernel void h3_expand_int4_int8(device const uint *q4 [[buffer(0)]],
@@ -1408,17 +1409,19 @@ kernel void h3_expand_int4_int8(device const uint *q4 [[buffer(0)]],
                                 device char4 *output [[buffer(2)]],
                                 constant int4_expand_args &args
                                     [[buffer(3)]],
+                                device const uchar *gzero [[buffer(4)]],
                                 uint gid [[thread_position_in_grid]]) {
     uint per_row = args.columns / 8;
     uint row = gid / per_row;
     if (row >= args.rows) return;
     uint column = (gid - row * per_row) * 8;
     uint packed = q4[gid];
-    float m = (float)gmul[row * (args.columns / args.group) +
-                          column / args.group];
+    uint g = row * (args.columns / args.group) + column / args.group;
+    float m = (float)gmul[g];
+    int zero = args.has_zero ? (int)gzero[g] : 8;
     char values[8];
     for (uint i = 0; i < 8; i++) {
-        int q = (int)((packed >> (4 * i)) & 15u) - 8;
+        int q = (int)((packed >> (4 * i)) & 15u) - zero;
         values[i] = (char)clamp((int)rint((float)q * m), -127, 127);
     }
     output[gid * 2] = char4(values[0], values[1], values[2], values[3]);

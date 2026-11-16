@@ -3143,11 +3143,12 @@ static int h3_gpu_quantize_bf16_int8_groups(
 
 /* quant: int4 -> int8 expansion of one weight matrix (see the kernel). q4 and
  * gmul are raw-byte (I8) tensors: rows*columns/2 and rows*columns/group*2. */
-typedef struct { uint32_t rows, columns, group; } int4_expand_args;
+typedef struct { uint32_t rows, columns, group, has_zero; } int4_expand_args;
 
 int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
                             const h3_gpu_tensor *q4,
-                            const h3_gpu_tensor *gmul, uint32_t rows,
+                            const h3_gpu_tensor *gmul,
+                            const h3_gpu_tensor *gzero, uint32_t rows,
                             uint32_t columns, uint32_t group) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !output || !q4 || !gmul || !rows || !group ||
@@ -3158,6 +3159,9 @@ int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
                            @"int4 packed weight") ||
         !h3_gpu_require_i8(gpu, gmul, (size_t)rows * (columns / group) * 2,
                            @"int4 group multipliers") ||
+        (gzero && !h3_gpu_require_i8(gpu, gzero,
+                                     (size_t)rows * (columns / group),
+                                     @"int4 group zero points")) ||
         !h3_gpu_require_command(gpu)) return 0;
     id<MTLComputePipelineState> pipeline =
         h3_gpu_pipeline(gpu, @"h3_expand_int4_int8");
@@ -3165,7 +3169,7 @@ int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"cannot build int4 expansion kernel");
         return 0;
     }
-    int4_expand_args args = {rows, columns, group};
+    int4_expand_args args = {rows, columns, group, gzero ? 1u : 0u};
     size_t threads = (size_t)rows * columns / 8;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
@@ -3175,6 +3179,8 @@ int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(gmul).buffer offset:0 atIndex:1];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder setBuffer:TENSOR(gzero ? gzero : gmul).buffer offset:0
+                   atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
