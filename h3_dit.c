@@ -2554,7 +2554,7 @@ static h3_dit *load_dit(const char *weight_directory,
         fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
                 mergeable ? "on" : !merge_wanted ? "off (H3_LORA_MERGE=0)" :
                 quant_available && lora_int8 && !dit->ssd_streaming ?
-                "off (offline int8 weights: runtime branch)" :
+                "off (offline quantized weights: runtime branch)" :
                 "off (streaming, bf16 path or a time-gated LoRA)");
         dit->lora_merge = mergeable;
         if (mergeable) goto lora_flags_done;
