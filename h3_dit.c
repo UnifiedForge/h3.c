@@ -1599,64 +1599,6 @@ static int merge_block_loras(h3_dit *dit, h3_dit_block *block,
                       "fc2", error, error_size);
 }
 
-/* quant-video: LoRA merge on offline int8 weights. Per projection that has
- * LoRA pairs: dequantize int8 * row scale into a BF16 scratch, add the deltas
- * exactly like merge_block_loras, requantize in place with the runtime row
- * quantizer. One scratch matrix extra, no BF16 checkpoint needed; the cost is
- * a second rounding of the base weight. */
-static h3_gpu_tensor *dequant_scratch;
-
-static int merge_int8_site(h3_dit *dit, h3_lora_site *site,
-                           h3_gpu_tensor *weight, h3_gpu_tensor *scales,
-                           uint32_t rows, uint32_t columns, const char *label,
-                           char *error, size_t error_size) {
-    if (!site->count) return 1;
-    if (!dequant_scratch) {
-        dequant_scratch = h3_gpu_tensor_new_bf16(dit->gpu,
-                                                 (size_t)FFN * 2 * HIDDEN);
-        if (!dequant_scratch) {
-            fail(error, error_size, "LoRA int8 merge scratch: %s",
-                 h3_gpu_error(dit->gpu));
-            return 0;
-        }
-    }
-    if (!h3_gpu_begin(dit->gpu) ||
-        !h3_gpu_dequantize_int8_bf16(dit->gpu, dequant_scratch, weight,
-                                     scales, rows, columns) ||
-        !h3_gpu_submit(dit->gpu)) {
-        fail(error, error_size, "LoRA int8 merge %s: %s", label,
-             h3_gpu_error(dit->gpu));
-        return 0;
-    }
-    if (!merge_site(dit, site, dequant_scratch, rows, columns, label,
-                    error, error_size)) return 0;
-    if (!h3_gpu_begin(dit->gpu) ||
-        !h3_gpu_quantize_weight_int8(dit->gpu, weight, scales,
-                                     dequant_scratch, rows, columns) ||
-        !h3_gpu_submit(dit->gpu)) {
-        fail(error, error_size, "LoRA int8 merge %s: %s", label,
-             h3_gpu_error(dit->gpu));
-        return 0;
-    }
-    return 1;
-}
-
-static int merge_block_loras_int8(h3_dit *dit, h3_dit_block *block,
-                                  char *error, size_t error_size) {
-    return merge_int8_site(dit, &block->lora_qkv, block->qkv_int8,
-                           block->qkv_scales, INNER * 3, HIDDEN, "qkv",
-                           error, error_size) &&
-           merge_int8_site(dit, &block->lora_out, block->out_int8,
-                           block->out_scales, HIDDEN, INNER, "out",
-                           error, error_size) &&
-           merge_int8_site(dit, &block->lora_fc1, block->fc1_int8,
-                           block->fc1_scales, FFN * 2, HIDDEN, "fc1",
-                           error, error_size) &&
-           merge_int8_site(dit, &block->lora_fc2, block->fc2_int8,
-                           block->fc2_scales, HIDDEN, FFN, "fc2",
-                           error, error_size);
-}
-
 /* quant: offline int8 checkpoint.
  *
  * <component>/transformer_int8/block-NN.safetensors holds, per block, the four
@@ -2107,8 +2049,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         int usable = dit->int8_mlp && dit->int8_qkv &&
             dit->int8_attention_out && !dit->keep_bf16_mlp &&
             !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
-            !(dit->lora_merge && dit->quant_bits != 8) &&
-            !getenv("H3_EXPORT_INT8_DIR");
+            !dit->lora_merge && !getenv("H3_EXPORT_INT8_DIR");
         fprintf(stderr, "h3: offline %s weights %s: %s\n",
                 dit->quant_bits == 4 ? (dit->int4_group == 64 ?
                     "int4-g64" : "int4-g128") : "int8",
@@ -2138,9 +2079,6 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !load_block_quantized(dit, &dit->blocks[index], index,
                                       error, error_size)) return 0;
-            if (dit->lora_merge && dit->quant_bits == 8 &&
-                !merge_block_loras_int8(dit, &dit->blocks[index],
-                                        error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -2163,8 +2101,6 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
     }
     h3_gpu_tensor_free(merge_scratch);
     merge_scratch = NULL;
-    h3_gpu_tensor_free(dequant_scratch);
-    dequant_scratch = NULL;
     if (dit->ssd_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
@@ -2609,19 +2545,31 @@ static h3_dit *load_dit(const char *weight_directory,
         /* On by default; H3_LORA_MERGE=0 keeps the runtime branches. */
         const char *merge_env = getenv("H3_LORA_MERGE");
         int merge_wanted = !(merge_env && !strcmp(merge_env, "0"));
-        /* quant: offline int8 blocks are merged by dequantize, add,
-         * requantize (merge_block_loras_int8); offline int4 blocks are
-         * re-expanded every block, so they keep the runtime branch. */
+        /* quant: merging needs the BF16 weights; with offline int8 blocks
+         * the runtime branch on the int8 projections is used instead. */
+        /* quant-video: a delta folded into offline int8 is lost wherever it
+         * is under half a quantization step (the weight already sits on the
+         * grid), measured: 0.14% of fc2 elements changed vs 100% for the
+         * BF16 merge. So with an ungated LoRA the blocks are read in BF16,
+         * merged and quantized exactly as without offline files (same bytes
+         * as before, only the load reads BF16). H3_QUANT_LORA=branch keeps
+         * the offline int8 blocks and applies the LoRA as a runtime branch
+         * (accurate, but slower steps and more memory). */
+        const char *quant_lora = getenv("H3_QUANT_LORA");
+        int keep_offline = quant_available && quant_lora &&
+                           !strcmp(quant_lora, "branch");
         int mergeable = merge_wanted && !dit->ssd_streaming && lora_int8 &&
-                        (!quant_available || dit->quant_bits == 8);
+                        !keep_offline &&
+                        !(quant_available && dit->quant_bits == 4);
         for (size_t e = 0; mergeable && e < loras->count; e++)
             if (loras->entries[e].from_sigma > 0.0f) mergeable = 0;
         fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
                 mergeable ? (quant_available ?
-                    "on (offline int8: dequantize, merge, requantize)" : "on") :
+                    "on (BF16 blocks, offline int8 not used for this run)" :
+                    "on") :
                 !merge_wanted ? "off (H3_LORA_MERGE=0)" :
                 quant_available && lora_int8 && !dit->ssd_streaming ?
-                "off (offline int4 weights: runtime branch)" :
+                "off (offline quantized weights: runtime branch)" :
                 "off (streaming, bf16 path or a time-gated LoRA)");
         dit->lora_merge = mergeable;
         if (mergeable) goto lora_flags_done;

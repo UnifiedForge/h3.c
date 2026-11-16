@@ -82,12 +82,6 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
 const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor);
-/* quant-video: w_bf16[r, c] = int8[r, c] * scales[r] (inverse of the row
- * quantizer), for folding LoRA deltas into offline int8 weights. */
-int h3_gpu_dequantize_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                                const h3_gpu_tensor *weight,
-                                const h3_gpu_tensor *scales, uint32_t rows,
-                                uint32_t columns);
 /* quant: expand an offline int4 matrix (packed nibbles + half group
  * multipliers, both raw-byte I8 tensors; optional U8 per-group zero
  * points, NULL = symmetric with zero 8) into an int8 weight buffer. */

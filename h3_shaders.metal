@@ -1428,27 +1428,6 @@ kernel void h3_expand_int4_int8(device const uint *q4 [[buffer(0)]],
     output[gid * 2 + 1] = char4(values[4], values[5], values[6], values[7]);
 }
 
-/* quant-video: inverse of the row quantizer, w = q * scale[row], used to fold
- * LoRA deltas into offline int8 weights at load (dequantize, merge,
- * requantize). One thread handles four columns. */
-struct int8_dequant_args {
-    uint rows;
-    uint columns;
-};
-
-kernel void h3_dequantize_int8_rows_bf16(device const char4 *input [[buffer(0)]],
-                                         device const float *scales [[buffer(1)]],
-                                         device bfloat4 *output [[buffer(2)]],
-                                         constant int8_dequant_args &args
-                                             [[buffer(3)]],
-                                         uint gid [[thread_position_in_grid]]) {
-    uint per_row = args.columns / 4;
-    uint row = gid / per_row;
-    if (row >= args.rows) return;
-    float scale = scales[row];
-    output[gid] = bfloat4(float4(input[gid]) * scale);
-}
-
 kernel void h3_quantize_bf16_int8_rows_scalar(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],
