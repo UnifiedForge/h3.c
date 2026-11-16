@@ -2299,7 +2299,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     /* quant: streaming may keep the int8 path when offline int8 blocks
      * exist, because then nothing has to be quantized per evaluation. */
-    dit->stream_int8 = dit->ssd_streaming && quant_find_dir(dit);
+    int quant_available = quant_find_dir(dit);
+    dit->stream_int8 = dit->ssd_streaming && quant_available;
     dit->int8_mlp = (!dit->ssd_streaming || dit->stream_int8) &&
                     dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -2365,11 +2366,16 @@ static h3_dit *load_dit(const char *weight_directory,
         /* On by default; H3_LORA_MERGE=0 keeps the runtime branches. */
         const char *merge_env = getenv("H3_LORA_MERGE");
         int merge_wanted = !(merge_env && !strcmp(merge_env, "0"));
-        int mergeable = merge_wanted && !dit->ssd_streaming && lora_int8;
+        /* quant: merging needs the BF16 weights; with offline int8 blocks
+         * the runtime branch on the int8 projections is used instead. */
+        int mergeable = merge_wanted && !dit->ssd_streaming && lora_int8 &&
+                        !quant_available;
         for (size_t e = 0; mergeable && e < loras->count; e++)
             if (loras->entries[e].from_sigma > 0.0f) mergeable = 0;
         fprintf(stderr, "h3: LoRA merge into weights at load: %s\n",
                 mergeable ? "on" : !merge_wanted ? "off (H3_LORA_MERGE=0)" :
+                quant_available && lora_int8 && !dit->ssd_streaming ?
+                "off (offline int8 weights: runtime branch)" :
                 "off (streaming, bf16 path or a time-gated LoRA)");
         dit->lora_merge = mergeable;
         if (mergeable) goto lora_flags_done;
