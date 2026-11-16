@@ -3,7 +3,10 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <fcntl.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -95,6 +98,9 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    /* quant: offline int8 weights (transformer_int8/block-NN.safetensors). */
+    int quantized;
+    char quantized_dir[4096];
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -1534,8 +1540,252 @@ static int merge_block_loras(h3_dit *dit, h3_dit_block *block,
                       "fc2", error, error_size);
 }
 
+/* quant: offline int8 checkpoint.
+ *
+ * <component>/transformer_int8/block-NN.safetensors holds, per block, the four
+ * projections exactly as the runtime quantizer produces them (row-wise
+ * symmetric int8, f32 scale per output row):
+ *   blocks.N.attn.qkv_proj.weight  I8 [21504, 5376]  + .weight_scale F32
+ *   blocks.N.attn.out_proj.weight  I8 [5376, 7168]   + .weight_scale F32
+ *   blocks.N.mlp.fc1.weight        I8 [28672, 5376]  + .weight_scale F32
+ *   blocks.N.mlp.fc2.weight        I8 [5376, 14336]  + .weight_scale F32
+ * Everything else (norms, refiner, embedders) still comes from the original
+ * checkpoint. Metadata: h3_quant=int8-row, h3_quant_version=1 and
+ * source_fnv64, a fingerprint of the original BF16 tensors (FNV-1a 64 over
+ * name, first 64 KiB and last 64 KiB of each of the four), so a file made from
+ * another checkpoint is refused instead of silently used.
+ * H3_QUANTIZED=0 disables, H3_QUANTIZED_DIR overrides the directory.
+ * H3_EXPORT_INT8_DIR=DIR writes the runtime-quantized blocks in this format
+ * (diagnostic: proves the offline quantizer bit-exact). */
+
+static const char *const QUANT_SUFFIX[4] = {
+    "attn.qkv_proj.weight", "attn.out_proj.weight",
+    "mlp.fc1.weight", "mlp.fc2.weight"
+};
+
+static void quant_shape(unsigned which, uint64_t *rows, uint64_t *columns) {
+    static const uint64_t r[4] = {INNER * 3, HIDDEN, FFN * 2, HIDDEN};
+    static const uint64_t c[4] = {HIDDEN, INNER, HIDDEN, FFN};
+    *rows = r[which];
+    *columns = c[which];
+}
+
+static uint64_t quant_fnv64(uint64_t hash, const void *data, size_t bytes) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < bytes; i++) {
+        hash ^= p[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static int quant_source_fingerprint(h3_dit *dit, unsigned block,
+                                    char out[17]) {
+    enum { SAMPLE = 64 * 1024 };
+    unsigned char *buffer = malloc(SAMPLE);
+    if (!buffer) return 0;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    int ok = 1;
+    for (unsigned which = 0; ok && which < 4; which++) {
+        char name[160];
+        snprintf(name, sizeof(name), "blocks.%u.%s", block,
+                 QUANT_SUFFIX[which]);
+        const h3_st_header *header = NULL;
+        const h3_st_tensor *tensor = h3_weight_find(dit->weights, name,
+                                                    &header);
+        if (!tensor || !header) { ok = 0; break; }
+        hash = quant_fnv64(hash, name, strlen(name));
+        uint64_t size = tensor->data_end - tensor->data_begin;
+        uint64_t take = size < SAMPLE ? size : SAMPLE;
+        uint64_t offsets[2] = {tensor->file_offset,
+                               tensor->file_offset + size - take};
+        int fd = open(header->path, O_RDONLY);
+        if (fd < 0) { ok = 0; break; }
+        for (int part = 0; ok && part < 2; part++) {
+            if (pread(fd, buffer, (size_t)take, (off_t)offsets[part]) !=
+                (ssize_t)take) ok = 0;
+            else hash = quant_fnv64(hash, buffer, (size_t)take);
+        }
+        close(fd);
+    }
+    free(buffer);
+    snprintf(out, 17, "%016llx", (unsigned long long)hash);
+    return ok;
+}
+
+/* Finds <component>/transformer_int8 (or H3_QUANTIZED_DIR). */
+static int quant_find_dir(h3_dit *dit) {
+    const char *flag = getenv("H3_QUANTIZED");
+    if (flag && !strcmp(flag, "0")) return 0;
+    const char *override = getenv("H3_QUANTIZED_DIR");
+    if (override && *override) {
+        snprintf(dit->quantized_dir, sizeof(dit->quantized_dir), "%s",
+                 override);
+    } else {
+        const h3_st_header *header = NULL;
+        if (!h3_weight_find(dit->weights, "blocks.0.attn.qkv_proj.weight",
+                            &header) || !header || !header->path) return 0;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s", header->path);
+        char *slash = strrchr(path, '/');
+        if (!slash) return 0;
+        *slash = '\0';               /* .../transformer */
+        snprintf(dit->quantized_dir, sizeof(dit->quantized_dir),
+                 "%s_int8", path);   /* .../transformer_int8 */
+    }
+    char first[4200];
+    snprintf(first, sizeof(first), "%s/block-%02u.safetensors",
+             dit->quantized_dir, first_active_block(dit));
+    struct stat info;
+    return stat(first, &info) == 0;
+}
+
+static int load_block_quantized(h3_dit *dit, h3_dit_block *block,
+                                unsigned index, char *error,
+                                size_t error_size) {
+    char path[4200];
+    snprintf(path, sizeof(path), "%s/block-%02u.safetensors",
+             dit->quantized_dir, index);
+    h3_st_header header;
+    if (!h3_st_read_header(path, &header, error, error_size)) return 0;
+    int ok = 0;
+    char expected[17];
+    const char *kind = h3_st_metadata(&header, "h3_quant");
+    const char *version = h3_st_metadata(&header, "h3_quant_version");
+    const char *source = h3_st_metadata(&header, "source_fnv64");
+    if (!kind || strcmp(kind, "int8-row") || !version ||
+        strcmp(version, "1")) {
+        fail(error, error_size, "%s: not an h3 int8-row v1 file", path);
+        goto done;
+    }
+    if (!quant_source_fingerprint(dit, index, expected) || !source ||
+        strcmp(source, expected)) {
+        fail(error, error_size, "%s was made from a different checkpoint "
+             "(source_fnv64 %s, expected %s); re-run the quantizer or set "
+             "H3_QUANTIZED=0", path, source ? source : "missing", expected);
+        goto done;
+    }
+    h3_gpu_tensor **weights[4] = {&block->qkv_int8, &block->out_int8,
+                                  &block->fc1_int8, &block->fc2_int8};
+    h3_gpu_tensor **scales[4] = {&block->qkv_scales, &block->out_scales,
+                                 &block->fc1_scales, &block->fc2_scales};
+    for (unsigned which = 0; which < 4; which++) {
+        uint64_t rows, columns;
+        quant_shape(which, &rows, &columns);
+        char name[160];
+        snprintf(name, sizeof(name), "blocks.%u.%s", index,
+                 QUANT_SUFFIX[which]);
+        const h3_st_tensor *w = h3_st_find(&header, name);
+        strncat(name, "_scale", sizeof(name) - strlen(name) - 1);
+        const h3_st_tensor *s = h3_st_find(&header, name);
+        if (!w || w->dtype != H3_DTYPE_I8 || w->ndim != 2 ||
+            w->shape[0] != rows || w->shape[1] != columns ||
+            !s || s->dtype != H3_DTYPE_F32 ||
+            h3_st_tensor_elements(s) != rows) {
+            fail(error, error_size, "%s: missing or misshapen %s", path, name);
+            goto done;
+        }
+        /* Uncached reads: the GPU copy is the only one worth keeping, so a
+         * 32 GB Mac never holds the 18 GiB twice (file cache + buffer). */
+        *weights[which] = h3_gpu_tensor_new_i8(dit->gpu,
+                                               (size_t)(rows * columns));
+        *scales[which] = h3_gpu_tensor_new_f32(dit->gpu, (size_t)rows);
+        if (!*weights[which] || !*scales[which]) {
+            fail(error, error_size, "cannot allocate %s: %s", name,
+                 h3_gpu_error(dit->gpu));
+            goto done;
+        }
+        if (!h3_gpu_tensor_stream_file(*weights[which], path, w->file_offset,
+                                       (size_t)(rows * columns), error,
+                                       error_size) ||
+            !h3_gpu_tensor_stream_file(*scales[which], path, s->file_offset,
+                                       (size_t)rows, error, error_size))
+            goto done;
+    }
+    ok = 1;
+done:
+    h3_st_free_header(&header);
+    return ok;
+}
+
+/* Diagnostic: dump the runtime-quantized block in the offline format. */
+static void export_block_int8(h3_dit *dit, h3_dit_block *block,
+                              unsigned index) {
+    const char *directory = getenv("H3_EXPORT_INT8_DIR");
+    if (!directory || !*directory) return;
+    const char *only = getenv("H3_EXPORT_INT8_BLOCKS");
+    if (only && *only) {
+        char token[16];
+        snprintf(token, sizeof(token), ",%u,", index);
+        char list[512];
+        snprintf(list, sizeof(list), ",%s,", only);
+        if (!strstr(list, token)) return;
+    }
+    const h3_gpu_tensor *weights[4] = {block->qkv_int8, block->out_int8,
+                                       block->fc1_int8, block->fc2_int8};
+    const h3_gpu_tensor *scales[4] = {block->qkv_scales, block->out_scales,
+                                      block->fc1_scales, block->fc2_scales};
+    for (unsigned which = 0; which < 4; which++)
+        if (!weights[which] || !scales[which]) return;
+    char source[17];
+    if (!quant_source_fingerprint(dit, index, source)) return;
+    char json[4096];
+    size_t used = (size_t)snprintf(json, sizeof(json),
+        "{\"__metadata__\":{\"h3_quant\":\"int8-row\",\"h3_quant_version\":"
+        "\"1\",\"source_fnv64\":\"%s\",\"producer\":\"h3 runtime export\"}",
+        source);
+    uint64_t offset = 0;
+    for (unsigned which = 0; which < 4; which++) {
+        uint64_t rows, columns;
+        quant_shape(which, &rows, &columns);
+        used += (size_t)snprintf(json + used, sizeof(json) - used,
+            ",\"blocks.%u.%s\":{\"dtype\":\"I8\",\"shape\":[%llu,%llu],"
+            "\"data_offsets\":[%llu,%llu]}"
+            ",\"blocks.%u.%s_scale\":{\"dtype\":\"F32\",\"shape\":[%llu],"
+            "\"data_offsets\":[%llu,%llu]}",
+            index, QUANT_SUFFIX[which], (unsigned long long)rows,
+            (unsigned long long)columns, (unsigned long long)offset,
+            (unsigned long long)(offset + rows * columns),
+            index, QUANT_SUFFIX[which], (unsigned long long)rows,
+            (unsigned long long)(offset + rows * columns),
+            (unsigned long long)(offset + rows * columns + rows * 4));
+        offset += rows * columns + rows * 4;
+    }
+    used += (size_t)snprintf(json + used, sizeof(json) - used, "}");
+    while (used % 8) json[used++] = ' ';
+    char path[4200];
+    snprintf(path, sizeof(path), "%s/block-%02u.safetensors", directory,
+             index);
+    FILE *file = fopen(path, "wb");
+    if (!file) return;
+    uint64_t header_size = used;
+    fwrite(&header_size, sizeof(header_size), 1, file);
+    fwrite(json, 1, used, file);
+    for (unsigned which = 0; which < 4; which++) {
+        uint64_t rows, columns;
+        quant_shape(which, &rows, &columns);
+        fwrite(h3_gpu_tensor_contents(weights[which]), 1,
+               (size_t)(rows * columns), file);
+        fwrite(h3_gpu_tensor_contents(scales[which]), 4, (size_t)rows, file);
+    }
+    fclose(file);
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
+    /* quant: offline int8 only where the runtime would quantize all four
+     * projections itself and nothing needs their BF16 form (merge, A/B). */
+    dit->quantized = 0;
+    if (quant_find_dir(dit)) {
+        int usable = dit->int8_mlp && dit->int8_qkv &&
+            dit->int8_attention_out && !dit->keep_bf16_mlp &&
+            !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
+            !dit->lora_merge && !getenv("H3_EXPORT_INT8_DIR");
+        fprintf(stderr, "h3: offline int8 weights %s: %s\n",
+                dit->quantized_dir, usable ? "on" :
+                "off (BF16 needed: int8 path disabled, LoRA merge or A/B)");
+        dit->quantized = usable;
+    }
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
@@ -1549,6 +1799,11 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (dit->quantized) {
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size) ||
+                !load_block_quantized(dit, &dit->blocks[index], index,
+                                      error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1564,6 +1819,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
+            export_block_int8(dit, &dit->blocks[index], index);
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);

@@ -753,21 +753,33 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                    sizeof(float), H3_GPU_F32, "F32");
 }
 
+/* quant: offline int8 weights (signed bytes). */
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   sizeof(int8_t), H3_GPU_I8, "I8");
+}
+
 static int h3_gpu_tensor_read_file_bf16_mode(
                                  h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  int uncached,
                                  char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
+    /* quant: any dtype when called with uncached = 2 (int8 streaming). */
+    int any_dtype = uncached == 2;
+    size_t item = !opaque ? 0 :
+        TENSOR(opaque).dtype == H3_GPU_I8 ? 1 :
+        TENSOR(opaque).dtype == H3_GPU_F32 ? 4 : 2;
     if (!opaque || !path || !*path ||
-        TENSOR(opaque).dtype != H3_GPU_BF16 ||
+        (!any_dtype && TENSOR(opaque).dtype != H3_GPU_BF16) ||
         elements != TENSOR(opaque).elements ||
-        elements > SIZE_MAX / sizeof(uint16_t) || file_offset > INT64_MAX) {
+        elements > SIZE_MAX / item || file_offset > INT64_MAX) {
         if (error && error_size)
-            snprintf(error, error_size, "invalid BF16 file read request");
+            snprintf(error, error_size, "invalid tensor file read request");
         return 0;
     }
-    size_t bytes = elements * sizeof(uint16_t);
+    size_t bytes = elements * item;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) {
         if (error && error_size)
             snprintf(error, error_size, "BF16 file read range overflows");
@@ -813,6 +825,13 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                  char *error, size_t error_size) {
     return h3_gpu_tensor_read_file_bf16_mode(
         opaque, path, file_offset, elements, 0, error, error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *opaque, const char *path,
+                               uint64_t file_offset, size_t elements,
+                               char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_bf16_mode(
+        opaque, path, file_offset, elements, 2, error, error_size);
 }
 
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
@@ -869,6 +888,11 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
         elements > TENSOR(tensor).elements) return 0;
     memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint16_t));
     return 1;
+}
+
+/* quant: raw view of a shared buffer (diagnostic int8 export). */
+const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor) {
+    return tensor ? TENSOR(tensor).buffer.contents : NULL;
 }
 
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,

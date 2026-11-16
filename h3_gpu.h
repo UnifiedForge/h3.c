@@ -62,6 +62,14 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
 /* As above, but ask Darwin to avoid retaining a second copy in the file cache.
  * Intended for large sequential weight streams whose destination is the only
  * useful resident copy. */
+/* quant: load an offline int8 weight (signed bytes) into shared storage. */
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
+/* quant: uncached file read into an existing tensor of any dtype (I8, F32,
+ * BF16), used to stream offline int8 blocks. */
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, size_t elements,
+                              char *error, size_t error_size);
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size);
@@ -73,6 +81,7 @@ int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
+const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
