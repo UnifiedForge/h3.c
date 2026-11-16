@@ -481,6 +481,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_quantize_bf16_int8_rows"];
             [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
             [names addObject:@"h3_expand_int4_int8"];
+            [names addObject:@"h3_dequantize_int8_rows_bf16"];
             [names addObject:
                 @"h3_quantize_bf16_int8_head_major_to_rows_cached"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
@@ -3181,6 +3182,46 @@ int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder setBuffer:TENSOR(gzero ? gzero : gmul).buffer offset:0
                    atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+typedef struct { uint32_t rows, columns; } int8_dequant_args;
+
+int h3_gpu_dequantize_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *weight,
+                                const h3_gpu_tensor *scales, uint32_t rows,
+                                uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !rows || !columns || columns % 4 ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"int8 dequantize output") ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)rows * columns,
+                           @"int8 weight to dequantize") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"int8 row scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_dequantize_int8_rows_bf16");
+    if (!pipeline) {
+        h3_gpu_set_error(gpu, @"cannot build int8 dequantize kernel");
+        return 0;
+    }
+    int8_dequant_args args = {rows, columns};
+    size_t threads = (size_t)rows * columns / 4;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
