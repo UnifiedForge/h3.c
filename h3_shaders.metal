@@ -1392,6 +1392,39 @@ kernel void h3_quantize_bf16_int8_rows(
 }
 
 /* Retained only for crossed kernel measurements against the vec4 path. */
+/* quant: expand one offline int4 matrix to the int8 layout the int8 kernels
+ * read. q4 packs two columns per byte (low nibble = even column, nibble =
+ * q + 8); gmul holds one half multiplier per (row, group) so that
+ * w8 = clamp(rint(q * gmul), +-127) shares the row's f32 int8 scale. One
+ * thread expands eight columns (four bytes). Bit-exact with quantize_h3.py. */
+struct int4_expand_args {
+    uint rows;
+    uint columns;
+    uint group;
+};
+
+kernel void h3_expand_int4_int8(device const uint *q4 [[buffer(0)]],
+                                device const half *gmul [[buffer(1)]],
+                                device char4 *output [[buffer(2)]],
+                                constant int4_expand_args &args
+                                    [[buffer(3)]],
+                                uint gid [[thread_position_in_grid]]) {
+    uint per_row = args.columns / 8;
+    uint row = gid / per_row;
+    if (row >= args.rows) return;
+    uint column = (gid - row * per_row) * 8;
+    uint packed = q4[gid];
+    float m = (float)gmul[row * (args.columns / args.group) +
+                          column / args.group];
+    char values[8];
+    for (uint i = 0; i < 8; i++) {
+        int q = (int)((packed >> (4 * i)) & 15u) - 8;
+        values[i] = (char)clamp((int)rint((float)q * m), -127, 127);
+    }
+    output[gid * 2] = char4(values[0], values[1], values[2], values[3]);
+    output[gid * 2 + 1] = char4(values[4], values[5], values[6], values[7]);
+}
+
 kernel void h3_quantize_bf16_int8_rows_scalar(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],

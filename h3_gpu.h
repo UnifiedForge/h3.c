@@ -82,6 +82,12 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
 const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor);
+/* quant: expand an offline int4 matrix (packed nibbles + half group
+ * multipliers, both raw-byte I8 tensors) into an int8 weight buffer. */
+int h3_gpu_expand_int4_int8(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *q4,
+                            const h3_gpu_tensor *gmul, uint32_t rows,
+                            uint32_t columns, uint32_t group);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,

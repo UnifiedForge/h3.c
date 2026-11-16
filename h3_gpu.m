@@ -480,6 +480,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
             [names addObject:@"h3_quantize_bf16_int8_rows"];
             [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
+            [names addObject:@"h3_expand_int4_int8"];
             [names addObject:
                 @"h3_quantize_bf16_int8_head_major_to_rows_cached"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
@@ -3132,6 +3133,50 @@ static int h3_gpu_quantize_bf16_int8_groups(
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreadgroups:MTLSizeMake(dispatch_rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* quant: int4 -> int8 expansion of one weight matrix (see the kernel). q4 and
+ * gmul are raw-byte (I8) tensors: rows*columns/2 and rows*columns/group*2. */
+typedef struct { uint32_t rows, columns, group; } int4_expand_args;
+
+int h3_gpu_expand_int4_int8(h3_gpu *opaque, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *q4,
+                            const h3_gpu_tensor *gmul, uint32_t rows,
+                            uint32_t columns, uint32_t group) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !output || !q4 || !gmul || !rows || !group ||
+        columns % 8 || columns % group || group % 8 ||
+        !h3_gpu_require_i8(gpu, output, (size_t)rows * columns,
+                           @"int8 expansion output") ||
+        !h3_gpu_require_i8(gpu, q4, (size_t)rows * columns / 2,
+                           @"int4 packed weight") ||
+        !h3_gpu_require_i8(gpu, gmul, (size_t)rows * (columns / group) * 2,
+                           @"int4 group multipliers") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_expand_int4_int8");
+    if (!pipeline) {
+        h3_gpu_set_error(gpu, @"cannot build int4 expansion kernel");
+        return 0;
+    }
+    int4_expand_args args = {rows, columns, group};
+    size_t threads = (size_t)rows * columns / 8;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(q4).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(gmul).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;

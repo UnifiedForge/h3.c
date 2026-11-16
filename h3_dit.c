@@ -56,6 +56,10 @@ typedef struct {
     h3_lora_site lora_out;
     h3_lora_site lora_fc1;
     h3_lora_site lora_fc2;
+    /* quant int4: packed nibbles and half group multipliers per matrix
+     * (qkv, out, fc1, fc2), raw-byte tensors; NULL for an int8 matrix. */
+    h3_gpu_tensor *q4[4];
+    h3_gpu_tensor *gmul[4];
 } h3_dit_block;
 
 enum {
@@ -108,6 +112,10 @@ struct h3_dit {
     /* quant: offline int8 weights (transformer_int8/block-NN.safetensors). */
     int quantized;
     int stream_int8;
+    int quant_bits;
+    unsigned int4_group;
+    unsigned int4_slot;
+    h3_dit_block int4_slots[2];
     char quantized_dir[4096];
     int keep_bf16_mlp;
     int activation_aliases;
@@ -722,6 +730,10 @@ static void free_block(h3_dit_block *block) {
     h3_lora_site_free(&block->lora_out);
     h3_lora_site_free(&block->lora_fc1);
     h3_lora_site_free(&block->lora_fc2);
+    for (unsigned which = 0; which < 4; which++) {
+        free_tensor(&block->q4[which]);
+        free_tensor(&block->gmul[which]);
+    }
 }
 
 static double stream_now(void) {
@@ -1658,50 +1670,93 @@ static int quant_source_fingerprint(h3_dit *dit, unsigned block,
     return ok;
 }
 
-/* Finds <component>/transformer_int8 (or H3_QUANTIZED_DIR). */
+/* Finds the offline checkpoint: H3_QUANTIZED_DIR, or <component>/
+ * transformer_int8 / transformer_int4 next to transformer/. H3_QUANT=int8 or
+ * int4 picks one; unset prefers int8 and falls back to int4. Reads the kind
+ * (and int4 group) from the first active block's metadata. */
 static int quant_find_dir(h3_dit *dit) {
     const char *flag = getenv("H3_QUANTIZED");
     if (flag && !strcmp(flag, "0")) return 0;
+    const char *want = getenv("H3_QUANT");
+    if (want && (!strcmp(want, "bf16") || !strcmp(want, "0"))) return 0;
     const char *override = getenv("H3_QUANTIZED_DIR");
+    char candidates[2][4096];
+    int count = 0;
     if (override && *override) {
-        snprintf(dit->quantized_dir, sizeof(dit->quantized_dir), "%s",
-                 override);
+        snprintf(candidates[count++], sizeof(candidates[0]), "%s", override);
     } else {
         const h3_st_header *header = NULL;
         if (!h3_weight_find(dit->weights, "blocks.0.attn.qkv_proj.weight",
                             &header) || !header || !header->path) return 0;
-        char path[4096];
+        char path[4000];
         snprintf(path, sizeof(path), "%s", header->path);
         char *slash = strrchr(path, '/');
         if (!slash) return 0;
         *slash = '\0';               /* .../transformer */
-        snprintf(dit->quantized_dir, sizeof(dit->quantized_dir),
-                 "%s_int8", path);   /* .../transformer_int8 */
+        int int4_first = want && !strcmp(want, "int4");
+        int only = want && (!strcmp(want, "int4") || !strcmp(want, "int8"));
+        snprintf(candidates[count++], sizeof(candidates[0]), "%s_%s", path,
+                 int4_first ? "int4" : "int8");
+        if (!only)
+            snprintf(candidates[count++], sizeof(candidates[0]), "%s_int4",
+                     path);
     }
-    char first[4200];
-    snprintf(first, sizeof(first), "%s/block-%02u.safetensors",
-             dit->quantized_dir, first_active_block(dit));
-    struct stat info;
-    return stat(first, &info) == 0;
+    for (int index = 0; index < count; index++) {
+        char first[4200];
+        snprintf(first, sizeof(first), "%s/block-%02u.safetensors",
+                 candidates[index], first_active_block(dit));
+        h3_st_header header;
+        char error[256];
+        if (!h3_st_read_header(first, &header, error, sizeof(error)))
+            continue;
+        const char *kind = h3_st_metadata(&header, "h3_quant");
+        int found = 0;
+        if (kind && !strcmp(kind, "int8-row")) {
+            dit->quant_bits = 8;
+            dit->int4_group = 0;
+            found = 1;
+        } else if (kind && (!strcmp(kind, "int4-g64") ||
+                            !strcmp(kind, "int4-g128"))) {
+            dit->quant_bits = 4;
+            dit->int4_group = !strcmp(kind, "int4-g64") ? 64 : 128;
+            found = 1;
+        }
+        h3_st_free_header(&header);
+        if (found) {
+            snprintf(dit->quantized_dir, sizeof(dit->quantized_dir), "%s",
+                     candidates[index]);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Reads and validates block-NN.safetensors: kind, version, source
- * fingerprint, and the shape of all eight tensors (w[i], s[i]). */
+ * fingerprint and every matrix. Per matrix either int8 (w[i] I8 + s[i] F32)
+ * or, in an int4 file, int4 (q4[i] U8 [rows, cols/2] + g[i] F16
+ * [rows, cols/group] + s[i] F32); w[i] is NULL for an int4 matrix. */
 static int quant_open_block(h3_dit *dit, unsigned index, char *path,
                             size_t path_size, h3_st_header *header,
                             const h3_st_tensor *w[4],
                             const h3_st_tensor *s[4],
+                            const h3_st_tensor *q4[4],
+                            const h3_st_tensor *g[4],
                             char *error, size_t error_size) {
     snprintf(path, path_size, "%s/block-%02u.safetensors",
              dit->quantized_dir, index);
     if (!h3_st_read_header(path, header, error, error_size)) return 0;
     char expected[17];
+    char want_kind[32];
+    if (dit->quant_bits == 4)
+        snprintf(want_kind, sizeof(want_kind), "int4-g%u", dit->int4_group);
+    else
+        snprintf(want_kind, sizeof(want_kind), "int8-row");
     const char *kind = h3_st_metadata(header, "h3_quant");
     const char *version = h3_st_metadata(header, "h3_quant_version");
     const char *source = h3_st_metadata(header, "source_fnv64");
-    if (!kind || strcmp(kind, "int8-row") || !version ||
+    if (!kind || strcmp(kind, want_kind) || !version ||
         strcmp(version, "1")) {
-        fail(error, error_size, "%s: not an h3 int8-row v1 file", path);
+        fail(error, error_size, "%s: not an h3 %s v1 file", path, want_kind);
         goto failed;
     }
     if (!quant_source_fingerprint(dit, index, expected) || !source ||
@@ -1714,18 +1769,40 @@ static int quant_open_block(h3_dit *dit, unsigned index, char *path,
     for (unsigned which = 0; which < 4; which++) {
         uint64_t rows, columns;
         quant_shape(which, &rows, &columns);
-        char name[160];
+        char name[192], extra[208];
         snprintf(name, sizeof(name), "blocks.%u.%s", index,
                  QUANT_SUFFIX[which]);
+        snprintf(extra, sizeof(extra), "%s_scale", name);
+        s[which] = h3_st_find(header, extra);
         w[which] = h3_st_find(header, name);
-        strncat(name, "_scale", sizeof(name) - strlen(name) - 1);
-        s[which] = h3_st_find(header, name);
-        if (!w[which] || w[which]->dtype != H3_DTYPE_I8 ||
-            w[which]->ndim != 2 || w[which]->shape[0] != rows ||
-            w[which]->shape[1] != columns || !s[which] ||
-            s[which]->dtype != H3_DTYPE_F32 ||
-            h3_st_tensor_elements(s[which]) != rows) {
-            fail(error, error_size, "%s: missing or misshapen %s", path, name);
+        q4[which] = g[which] = NULL;
+        int scale_ok = s[which] && s[which]->dtype == H3_DTYPE_F32 &&
+                       h3_st_tensor_elements(s[which]) == rows;
+        if (w[which]) {
+            if (w[which]->dtype != H3_DTYPE_I8 || w[which]->ndim != 2 ||
+                w[which]->shape[0] != rows || w[which]->shape[1] != columns ||
+                !scale_ok) {
+                fail(error, error_size, "%s: misshapen %s", path, name);
+                goto failed;
+            }
+            continue;
+        }
+        if (dit->quant_bits != 4) {
+            fail(error, error_size, "%s: missing %s", path, name);
+            goto failed;
+        }
+        uint64_t group = dit->int4_group;
+        snprintf(extra, sizeof(extra), "%s_q4", name);
+        q4[which] = h3_st_find(header, extra);
+        snprintf(extra, sizeof(extra), "%s_gmul", name);
+        g[which] = h3_st_find(header, extra);
+        if (!q4[which] || q4[which]->dtype != H3_DTYPE_U8 ||
+            h3_st_tensor_elements(q4[which]) != rows * columns / 2 ||
+            !g[which] || g[which]->dtype != H3_DTYPE_F16 ||
+            h3_st_tensor_elements(g[which]) != rows * (columns / group) ||
+            !scale_ok) {
+            fail(error, error_size, "%s: missing or misshapen int4 %s",
+                 path, name);
             goto failed;
         }
     }
@@ -1739,11 +1816,17 @@ static int prepare_stream_layer_int8(h3_dit *dit, unsigned layer,
                                      char *error, size_t error_size) {
     h3_dit_stream_layer *stream = &dit->stream_layers[layer];
     h3_st_header header;
-    const h3_st_tensor *w[4], *s[4];
+    const h3_st_tensor *w[4], *s[4], *q4[4], *g[4];
     if (!quant_open_block(dit, layer, stream->quant_path,
-                          sizeof(stream->quant_path), &header, w, s,
+                          sizeof(stream->quant_path), &header, w, s, q4, g,
                           error, error_size)) return 0;
     for (unsigned which = 0; which < 4; which++) {
+        if (!w[which]) {
+            fail(error, error_size, "%s: int4 blocks cannot be streamed yet",
+                 stream->quant_path);
+            h3_st_free_header(&header);
+            return 0;
+        }
         uint64_t rows, columns;
         quant_shape(which, &rows, &columns);
         stream->sources[which] = (h3_dit_stream_source){
@@ -1760,14 +1843,32 @@ static int prepare_stream_layer_int8(h3_dit *dit, unsigned layer,
     return 1;
 }
 
+static h3_gpu_tensor *quant_read_bytes(h3_dit *dit, const char *path,
+                                       const h3_st_tensor *tensor,
+                                       char *error, size_t error_size) {
+    size_t bytes = (size_t)(tensor->data_end - tensor->data_begin);
+    h3_gpu_tensor *result = h3_gpu_tensor_new_i8(dit->gpu, bytes);
+    if (!result) {
+        fail(error, error_size, "cannot allocate %s: %s", tensor->name,
+             h3_gpu_error(dit->gpu));
+        return NULL;
+    }
+    if (!h3_gpu_tensor_stream_file(result, path, tensor->file_offset, bytes,
+                                   error, error_size)) {
+        h3_gpu_tensor_free(result);
+        return NULL;
+    }
+    return result;
+}
+
 static int load_block_quantized(h3_dit *dit, h3_dit_block *block,
                                 unsigned index, char *error,
                                 size_t error_size) {
     char path[4200];
     h3_st_header header;
-    const h3_st_tensor *wt[4], *st[4];
+    const h3_st_tensor *wt[4], *st[4], *q4t[4], *gt[4];
     if (!quant_open_block(dit, index, path, sizeof(path), &header, wt, st,
-                          error, error_size)) return 0;
+                          q4t, gt, error, error_size)) return 0;
     int ok = 0;
     h3_gpu_tensor **weights[4] = {&block->qkv_int8, &block->out_int8,
                                   &block->fc1_int8, &block->fc2_int8};
@@ -1776,31 +1877,87 @@ static int load_block_quantized(h3_dit *dit, h3_dit_block *block,
     for (unsigned which = 0; which < 4; which++) {
         uint64_t rows, columns;
         quant_shape(which, &rows, &columns);
-        const h3_st_tensor *w = wt[which], *s = st[which];
-        char name[160];
-        snprintf(name, sizeof(name), "blocks.%u.%s", index,
-                 QUANT_SUFFIX[which]);
         /* Uncached reads: the GPU copy is the only one worth keeping, so a
-         * 32 GB Mac never holds the 18 GiB twice (file cache + buffer). */
-        *weights[which] = h3_gpu_tensor_new_i8(dit->gpu,
-                                               (size_t)(rows * columns));
+         * 32 GB Mac never holds the weights twice (file cache + buffer). */
         *scales[which] = h3_gpu_tensor_new_f32(dit->gpu, (size_t)rows);
-        if (!*weights[which] || !*scales[which]) {
-            fail(error, error_size, "cannot allocate %s: %s", name,
-                 h3_gpu_error(dit->gpu));
+        if (!*scales[which] ||
+            !h3_gpu_tensor_stream_file(*scales[which], path,
+                                       st[which]->file_offset, (size_t)rows,
+                                       error, error_size)) {
+            if (!error[0])
+                fail(error, error_size, "cannot load %s scales: %s", path,
+                     h3_gpu_error(dit->gpu));
             goto done;
         }
-        if (!h3_gpu_tensor_stream_file(*weights[which], path, w->file_offset,
-                                       (size_t)(rows * columns), error,
-                                       error_size) ||
-            !h3_gpu_tensor_stream_file(*scales[which], path, s->file_offset,
-                                       (size_t)rows, error, error_size))
-            goto done;
+        if (!wt[which]) {
+            block->q4[which] = quant_read_bytes(dit, path, q4t[which],
+                                                error, error_size);
+            block->gmul[which] = quant_read_bytes(dit, path, gt[which],
+                                                  error, error_size);
+            if (!block->q4[which] || !block->gmul[which]) goto done;
+            continue;
+        }
+        *weights[which] = quant_read_bytes(dit, path, wt[which],
+                                           error, error_size);
+        if (!*weights[which]) goto done;
     }
     ok = 1;
 done:
     h3_st_free_header(&header);
     return ok;
+}
+
+/* int4: expands the block's int4 matrices into the alternating int8 slot and
+ * points `weight` at them. Encoded on the ordered stream right before the
+ * block, so the int8 kernels read finished data; the two slots let the next
+ * expansion overlap the current block. */
+static int expand_block_int4(h3_dit *dit, unsigned block,
+                             h3_dit_block *weight, char *error,
+                             size_t error_size) {
+    h3_dit_block *slot = &dit->int4_slots[dit->int4_slot];
+    dit->int4_slot ^= 1u;
+    h3_gpu_tensor *targets[4] = {slot->qkv_int8, slot->out_int8,
+                                 slot->fc1_int8, slot->fc2_int8};
+    h3_gpu_tensor **fields[4] = {&weight->qkv_int8, &weight->out_int8,
+                                 &weight->fc1_int8, &weight->fc2_int8};
+    const h3_dit_block *source = &dit->blocks[block];
+    for (unsigned which = 0; which < 4; which++) {
+        if (!source->q4[which]) continue;
+        uint64_t rows, columns;
+        quant_shape(which, &rows, &columns);
+        if (!h3_gpu_expand_int4_int8(dit->gpu, targets[which],
+                                     source->q4[which], source->gmul[which],
+                                     (uint32_t)rows, (uint32_t)columns,
+                                     dit->int4_group)) {
+            fail(error, error_size, "int4 expansion of block %u failed: %s",
+                 block, h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        *fields[which] = targets[which];
+    }
+    return 1;
+}
+
+static int allocate_int4_slots(h3_dit *dit, char *error,
+                               size_t error_size) {
+    for (unsigned index = 0; index < 2; index++) {
+        h3_dit_block *slot = &dit->int4_slots[index];
+        slot->qkv_int8 = h3_gpu_tensor_new_i8(dit->gpu,
+                                              (size_t)INNER * 3 * HIDDEN);
+        slot->out_int8 = h3_gpu_tensor_new_i8(dit->gpu,
+                                              (size_t)HIDDEN * INNER);
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(dit->gpu,
+                                              (size_t)FFN * 2 * HIDDEN);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(dit->gpu,
+                                              (size_t)HIDDEN * FFN);
+        if (!slot->qkv_int8 || !slot->out_int8 || !slot->fc1_int8 ||
+            !slot->fc2_int8) {
+            fail(error, error_size, "cannot allocate int4 expansion slot: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Diagnostic: dump the runtime-quantized block in the offline format. */
@@ -1876,10 +2033,14 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             dit->int8_attention_out && !dit->keep_bf16_mlp &&
             !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
             !dit->lora_merge && !getenv("H3_EXPORT_INT8_DIR");
-        fprintf(stderr, "h3: offline int8 weights %s: %s\n",
+        fprintf(stderr, "h3: offline %s weights %s: %s\n",
+                dit->quant_bits == 4 ? (dit->int4_group == 64 ?
+                    "int4-g64" : "int4-g128") : "int8",
                 dit->quantized_dir, usable ? "on" :
                 "off (BF16 needed: int8 path disabled, LoRA merge or A/B)");
         dit->quantized = usable;
+        if (usable && dit->quant_bits == 4 &&
+            !allocate_int4_slots(dit, error, error_size)) return 0;
     }
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
@@ -2300,7 +2461,8 @@ static h3_dit *load_dit(const char *weight_directory,
     /* quant: streaming may keep the int8 path when offline int8 blocks
      * exist, because then nothing has to be quantized per evaluation. */
     int quant_available = quant_find_dir(dit);
-    dit->stream_int8 = dit->ssd_streaming && quant_available;
+    dit->stream_int8 = dit->ssd_streaming && quant_available &&
+                       dit->quant_bits == 8;
     dit->int8_mlp = (!dit->ssd_streaming || dit->stream_int8) &&
                     dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -3147,6 +3309,13 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                     return 0;
                 }
                 stream_started = 1;
+            }
+            if (!dit->ssd_streaming && dit->quantized &&
+                dit->quant_bits == 4) {
+                streamed_weight = dit->blocks[block];
+                if (!expand_block_int4(dit, block, &streamed_weight,
+                                       error, error_size)) return 0;
+                weight = &streamed_weight;
             }
             if (!prof_cut(dit, PROF_OTHER)) {
                 fail(error, error_size, "opprof cut: %s", h3_gpu_error(dit->gpu));
@@ -4161,6 +4330,8 @@ void h3_dit_free(h3_dit *dit) {
         free_block(&dit->blocks[block]);
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
+    free_block(&dit->int4_slots[0]);
+    free_block(&dit->int4_slots[1]);
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
