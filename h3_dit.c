@@ -3,6 +3,7 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -98,6 +99,10 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int lora_merge;  /* accel-lora-merge: LoRA folded into bf16 weights before int8 */
+    int lora_fused;  /* quant-fused: offline int8 folder already holds the merged LoRA */
+    size_t fused_count;      /* leading entries of the set that the folder holds */
+    h3_lora_set block_rest;  /* H3_FUSED_PARTIAL: the other entries, as a branch */
+    char fused_label[64];
     int int8_attention_out;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
@@ -653,10 +658,18 @@ static int load_block_loras(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
     if (!dit->loras || !dit->loras->count) return 1;
+    /* quant-fused: the four projections of the transformer blocks come
+     * from a folder that already holds them merged; the token refiner and
+     * the AdaLN pairs still take the LoRA exactly as before. */
+    const h3_lora_set *set = dit->loras;
+    if (dit->lora_fused && !strncmp(prefix, "blocks.", 7)) {
+        if (!dit->block_rest.count) return 1;
+        set = &dit->block_rest;
+    }
     char name[160];
 #define SITE(field, suffix) do {                                               \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                      \
-    if (!h3_lora_site_build(dit->loras, dit->gpu, name, &block->field,         \
+    if (!h3_lora_site_build(set, dit->gpu, name, &block->field,                \
                             error, error_size)) return 0;                      \
 } while (0)
     SITE(lora_qkv, "attn.qkv_proj");
@@ -1733,6 +1746,153 @@ static int quant_find_dir(h3_dit *dit) {
     return 0;
 }
 
+/* quant-fused: offline int8 folders with speed LoRAs merged in.
+ *
+ * <component>/transformer_int8__<label>/ holds the same files as
+ * transformer_int8/, written by the runtime export (H3_EXPORT_INT8_DIR) of a
+ * run whose ungated LoRA set was merged at load: the bytes the merge +
+ * runtime int8 path produces, so a run with the same set gives the same
+ * video. Extra metadata: fused_lora_key (what is matched), fused_loras (the
+ * readable list), fused_label. The key lists, in order, each LoRA file by
+ * content (size + FNV-1a 64 over its first and last MiB, not its path) and
+ * its strength. Order matters: the merge adds the deltas in BF16 one after
+ * another. H3_FUSED=0 disables. */
+static int lora_file_fingerprint(const char *path, char *out, size_t size) {
+    enum { SAMPLE = 1024 * 1024 };
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat info;
+    if (fstat(fd, &info) != 0) { close(fd); return 0; }
+    uint64_t length = (uint64_t)info.st_size;
+    uint64_t take = length < SAMPLE ? length : SAMPLE;
+    unsigned char *buffer = malloc(SAMPLE);
+    int ok = buffer != NULL;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    uint64_t offsets[2] = {0, length - take};
+    for (int part = 0; ok && part < 2; part++) {
+        if (pread(fd, buffer, (size_t)take, (off_t)offsets[part]) !=
+            (ssize_t)take) ok = 0;
+        else hash = quant_fnv64(hash, buffer, (size_t)take);
+    }
+    free(buffer);
+    close(fd);
+    if (ok) snprintf(out, size, "%llx-%016llx", (unsigned long long)length,
+                     (unsigned long long)hash);
+    return ok;
+}
+
+/* key = "<fingerprint>*<strength>;..." in set order; 0 when the set is
+ * empty, gated (from_sigma) or unreadable. readable = "name*strength; ...". */
+static int fused_lora_key(const h3_lora_set *loras, size_t count,
+                          char *key, size_t size,
+                          char *readable, size_t readable_size) {
+    if (!loras || !count || count > loras->count) return 0;
+    size_t used = 0, shown = 0;
+    key[0] = '\0';
+    if (readable && readable_size) readable[0] = '\0';
+    for (size_t e = 0; e < count; e++) {
+        const h3_lora_entry *entry = &loras->entries[e];
+        if (entry->from_sigma > 0.0f || !entry->adapter ||
+            !entry->adapter->path) return 0;
+        char print[64];
+        if (!lora_file_fingerprint(entry->adapter->path, print,
+                                   sizeof(print))) return 0;
+        int n = snprintf(key + used, size - used, "%s%s*%.6g",
+                         e ? ";" : "", print, (double)entry->strength);
+        if (n < 0 || (size_t)n >= size - used) return 0;
+        used += (size_t)n;
+        if (readable && readable_size) {
+            const char *base = strrchr(entry->adapter->path, '/');
+            base = base ? base + 1 : entry->adapter->path;
+            n = snprintf(readable + shown, readable_size - shown, "%s%s*%.6g",
+                         e ? "; " : "", base, (double)entry->strength);
+            if (n > 0 && (size_t)n < readable_size - shown) shown += (size_t)n;
+        }
+    }
+    return 1;
+}
+
+/* Looks for <component>/transformer_int8__<label> whose fused_lora_key matches
+ * this run's LoRA set. The first match in name order wins. */
+static int fused_find_dir(h3_dit *dit, const h3_lora_set *loras) {
+    dit->lora_fused = 0;
+    dit->fused_label[0] = '\0';
+    if (!loras || !loras->count) return 0;
+    const char *flag = getenv("H3_FUSED");
+    if (flag && !strcmp(flag, "0")) return 0;
+    flag = getenv("H3_QUANTIZED");
+    if (flag && !strcmp(flag, "0")) return 0;
+    const char *want = getenv("H3_QUANT");
+    if (want && *want && strcmp(want, "int8")) return 0;
+    const char *quant_lora = getenv("H3_QUANT_LORA");
+    if (quant_lora && !strcmp(quant_lora, "branch")) return 0;
+    if (getenv("H3_EXPORT_INT8_DIR") || getenv("H3_QUANTIZED_DIR")) return 0;
+    /* exact set first; H3_FUSED_PARTIAL=1 also takes a folder that holds
+     * the leading entries (the preset comes first in Pro's argv) and runs
+     * the rest as a branch on top of it. */
+    const char *partial = getenv("H3_FUSED_PARTIAL");
+    size_t lowest = partial && !strcmp(partial, "1") ? 1 : loras->count;
+    char keys[8][2048];
+    size_t counts[8], key_count = 0;
+    for (size_t n = loras->count; n >= lowest && key_count < 8; n--)
+        if (fused_lora_key(loras, n, keys[key_count], sizeof(keys[0]), NULL, 0))
+            counts[key_count++] = n;
+    if (!key_count) return 0;
+    const h3_st_header *header = NULL;
+    if (!h3_weight_find(dit->weights, "blocks.0.attn.qkv_proj.weight",
+                        &header) || !header || !header->path) return 0;
+    char component[4000];
+    snprintf(component, sizeof(component), "%s", header->path);
+    for (int up = 0; up < 2; up++) {          /* file, then transformer/ */
+        char *slash = strrchr(component, '/');
+        if (!slash) return 0;
+        *slash = '\0';
+    }
+    DIR *directory = opendir(component);
+    if (!directory) return 0;
+    char best[256] = "";
+    size_t best_count = 0;
+    struct dirent *item;
+    while ((item = readdir(directory)) != NULL) {
+        const char *name = item->d_name;
+        if (strncmp(name, "transformer_int8__", 18) || strchr(name, '.'))
+            continue;
+        char first[4400];
+        snprintf(first, sizeof(first), "%s/%s/block-%02u.safetensors",
+                 component, name, first_active_block(dit));
+        h3_st_header block;
+        char error[256];
+        if (!h3_st_read_header(first, &block, error, sizeof(error))) continue;
+        const char *kind = h3_st_metadata(&block, "h3_quant");
+        const char *fused = h3_st_metadata(&block, "fused_lora_key");
+        size_t n = 0;
+        for (size_t k = 0; kind && !strcmp(kind, "int8-row") && fused &&
+             k < key_count; k++)
+            if (!strcmp(fused, keys[k])) { n = counts[k]; break; }
+        /* the most entries wins, then the first name */
+        if (n && (n > best_count ||
+                  (n == best_count && strcmp(name, best) < 0))) {
+            best_count = n;
+            snprintf(best, sizeof(best), "%s", name);
+            const char *label = h3_st_metadata(&block, "fused_label");
+            snprintf(dit->fused_label, sizeof(dit->fused_label), "%s",
+                     label && *label ? label : name + 18);
+        }
+        h3_st_free_header(&block);
+    }
+    closedir(directory);
+    if (!*best) return 0;
+    snprintf(dit->quantized_dir, sizeof(dit->quantized_dir), "%s/%s",
+             component, best);
+    dit->quant_bits = 8;
+    dit->int4_group = 0;
+    dit->lora_fused = 1;
+    dit->fused_count = best_count;
+    dit->block_rest.entries = loras->entries + best_count;
+    dit->block_rest.count = loras->count - best_count;
+    return 1;
+}
+
 /* Reads and validates block-NN.safetensors: kind, version, source
  * fingerprint and every matrix. Per matrix either int8 (w[i] I8 + s[i] F32)
  * or, in an int4 file, int4 (q4[i] U8 [rows, cols/2] + g[i] F16
@@ -1998,11 +2158,24 @@ static void export_block_int8(h3_dit *dit, h3_dit_block *block,
         if (!weights[which] || !scales[which]) return;
     char source[17];
     if (!quant_source_fingerprint(dit, index, source)) return;
-    char json[4096];
+    char json[8192];
     size_t used = (size_t)snprintf(json, sizeof(json),
         "{\"__metadata__\":{\"h3_quant\":\"int8-row\",\"h3_quant_version\":"
-        "\"1\",\"source_fnv64\":\"%s\",\"producer\":\"h3 runtime export\"}",
+        "\"1\",\"source_fnv64\":\"%s\",\"producer\":\"h3 runtime export\"",
         source);
+    /* quant-fused: a merged LoRA set makes this a fused folder. */
+    char key[2048], readable[2048];
+    if (dit->lora_merge &&
+        fused_lora_key(dit->loras, dit->loras ? dit->loras->count : 0,
+                       key, sizeof(key), readable,
+                       sizeof(readable))) {
+        const char *label = getenv("H3_FUSED_LABEL");
+        used += (size_t)snprintf(json + used, sizeof(json) - used,
+            ",\"fused_lora_key\":\"%s\",\"fused_loras\":\"%s\","
+            "\"fused_label\":\"%s\"", key, readable,
+            label ? label : "");
+    }
+    used += (size_t)snprintf(json + used, sizeof(json) - used, "}");
     uint64_t offset = 0;
     for (unsigned which = 0; which < 4; which++) {
         uint64_t rows, columns;
@@ -2045,12 +2218,13 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
     /* quant: offline int8 only where the runtime would quantize all four
      * projections itself and nothing needs their BF16 form (merge, A/B). */
     dit->quantized = 0;
-    if (quant_find_dir(dit)) {
+    if (dit->lora_fused || quant_find_dir(dit)) {
         int usable = dit->int8_mlp && dit->int8_qkv &&
             dit->int8_attention_out && !dit->keep_bf16_mlp &&
             !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
             !dit->lora_merge && !getenv("H3_EXPORT_INT8_DIR");
         fprintf(stderr, "h3: offline %s weights %s: %s\n",
+                dit->lora_fused ? "fused int8" :
                 dit->quant_bits == 4 ? (dit->int4_group == 64 ?
                     "int4-g64" : "int4-g128") : "int8",
                 dit->quantized_dir, usable ? "on" :
@@ -2477,7 +2651,7 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     /* quant: streaming may keep the int8 path when offline int8 blocks
      * exist, because then nothing has to be quantized per evaluation. */
-    int quant_available = quant_find_dir(dit);
+    int quant_available = fused_find_dir(dit, loras) || quant_find_dir(dit);
     dit->stream_int8 = dit->ssd_streaming && quant_available &&
                        dit->quant_bits == 8;
     dit->int8_mlp = (!dit->ssd_streaming || dit->stream_int8) &&
@@ -2543,6 +2717,36 @@ static h3_dit *load_dit(const char *weight_directory,
         /* accel-lora-merge: every entry ungated and weights resident -> fold
          * the deltas into the weights at load and keep the fused paths. */
         /* On by default; H3_LORA_MERGE=0 keeps the runtime branches. */
+        /* quant-fused: the folder already holds this LoRA set merged into
+         * the four block projections -> load it as plain int8, build no
+         * block sites, keep the fused int8 paths (as after a merge). */
+        if (dit->lora_fused) {
+            int usable = lora_int8 && dit->int8_mlp && dit->int8_qkv &&
+                dit->int8_attention_out && !dit->keep_bf16_mlp &&
+                !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
+                !dit->use_int8_row_fc2;
+            if (usable && !dit->block_rest.count) {
+                fprintf(stderr, "h3: fused int8 %s (%s): on, LoRA in the "
+                        "transformer blocks skipped (already merged)\n",
+                        dit->quantized_dir, dit->fused_label);
+                dit->lora_merge = 0;
+                goto lora_flags_done;
+            }
+            if (usable) {
+                fprintf(stderr, "h3: fused int8 %s (%s): on for the first %zu "
+                        "LoRA, the other %zu as a runtime branch "
+                        "(H3_FUSED_PARTIAL)\n", dit->quantized_dir,
+                        dit->fused_label, dit->fused_count,
+                        dit->block_rest.count);
+                dit->lora_merge = 0;
+                goto lora_branch_flags;
+            }
+            fprintf(stderr, "h3: fused int8 %s: off (int8 path disabled)\n",
+                    dit->quantized_dir);
+            dit->lora_fused = 0;
+            dit->block_rest.count = 0;
+            quant_available = quant_find_dir(dit);
+        }
         const char *merge_env = getenv("H3_LORA_MERGE");
         int merge_wanted = !(merge_env && !strcmp(merge_env, "0"));
         /* quant: merging needs the BF16 weights; with offline int8 blocks
@@ -2573,6 +2777,7 @@ static h3_dit *load_dit(const char *weight_directory,
                 "off (streaming, bf16 path or a time-gated LoRA)");
         dit->lora_merge = mergeable;
         if (mergeable) goto lora_flags_done;
+lora_branch_flags:
         dit->fused_mlp = 0;
         dit->nax_mlp = 0;
         dit->keep_bf16_qkv = 0;
