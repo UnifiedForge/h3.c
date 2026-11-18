@@ -823,10 +823,35 @@ static int stitch_latents(float **tiles, int channels, int latent_time,
     return 1;
 }
 
+/* The stitched tensor is [48,T,H,W]: blended mean then blended log-variance,
+ * as the reference blends the moments before it draws. z = mean +
+ * exp(0.5 * clamp(logvar, -30, 20)) * noise, rounded to float16 (the released
+ * recipe), then normalized, in place over the first 24 channels. One function
+ * for the fresh encode and for moments restored from te_cache, so both draw
+ * with the same instructions. */
+static void sample_moments(h3_video_latent *output, const float *posterior_noise,
+                           const float *latent_mean, const float *latent_std) {
+    size_t plane = (size_t)output->time * output->height * output->width;
+    for (int channel = 0; channel < LATENT_CHANNELS; channel++)
+        for (size_t index = 0; index < plane; index++) {
+            size_t at = (size_t)channel * plane + index;
+            float mean = output->values[at];
+            float logvar = output->values[at + LATENT_CHANNELS * plane];
+            if (logvar < -30.0f) logvar = -30.0f;
+            if (logvar > 20.0f) logvar = 20.0f;
+            float value = posterior_noise ?
+                mean + expf(0.5f * logvar) * posterior_noise[at] : mean;
+            value = (float)(_Float16)value;
+            output->values[at] = (value - latent_mean[channel]) /
+                                 latent_std[channel];
+        }
+}
+
 static int encode_common(const char *weight_directory,
                         const char *shader_source_path,
                         const float *pixels, int frames, int height, int width,
                         int moments, const float *posterior_noise,
+                        float *stats_out,
                         h3_video_encoder_progress progress, void *progress_opaque,
                         h3_video_latent *output,
                         char *error, size_t error_size) {
@@ -905,26 +930,16 @@ static int encode_common(const char *weight_directory,
                                 LATENT_CHANNELS, latent_time, &y_axis, &x_axis,
                                 output, error, error_size) &&
                  h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
-    if (ok && moments) {
-        /* The stitched tensor is [48,T,H,W]: blended mean then blended
-         * log-variance, as the reference blends the moments before it draws.
-         * z = mean + exp(0.5 * clamp(logvar, -30, 20)) * noise, rounded to
-         * float16 (the released recipe), then normalized, in place over the
-         * first 24 channels. */
-        size_t plane = (size_t)latent_time * output->height * output->width;
-        for (int channel = 0; channel < LATENT_CHANNELS; channel++)
-            for (size_t index = 0; index < plane; index++) {
-                size_t at = (size_t)channel * plane + index;
-                float mean = output->values[at];
-                float logvar = output->values[at + LATENT_CHANNELS * plane];
-                if (logvar < -30.0f) logvar = -30.0f;
-                if (logvar > 20.0f) logvar = 20.0f;
-                float value = posterior_noise ?
-                    mean + expf(0.5f * logvar) * posterior_noise[at] : mean;
-                value = (float)(_Float16)value;
-                output->values[at] = (value - encoder.latent_mean[channel]) /
-                                     encoder.latent_std[channel];
-            }
+    if (ok && moments && stats_out) {
+        /* te_cache: hand back the blended moments untouched, with the
+         * normalization the draw needs; h3_video_vae_sample_image_moments
+         * finishes the latent for any posterior noise later. */
+        memcpy(stats_out, encoder.latent_mean, sizeof(encoder.latent_mean));
+        memcpy(stats_out + LATENT_CHANNELS, encoder.latent_std,
+               sizeof(encoder.latent_std));
+    } else if (ok && moments) {
+        sample_moments(output, posterior_noise, encoder.latent_mean,
+                       encoder.latent_std);
     }
     if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
@@ -942,7 +957,7 @@ int h3_video_vae_encode(const char *weight_directory,
                         h3_video_latent *output,
                         char *error, size_t error_size) {
     return encode_common(weight_directory, shader_source_path, pixels, frames,
-                         height, width, 0, NULL, progress, progress_opaque,
+                         height, width, 0, NULL, NULL, progress, progress_opaque,
                          output, error, error_size);
 }
 
@@ -955,8 +970,31 @@ int h3_video_vae_encode_image_sampled(
                         h3_video_latent *output,
                         char *error, size_t error_size) {
     return encode_common(weight_directory, shader_source_path, pixels, 1,
-                         height, width, 1, posterior_noise, progress,
+                         height, width, 1, posterior_noise, NULL, progress,
                          progress_opaque, output, error, error_size);
+}
+
+int h3_video_vae_encode_image_moments(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const float *pixels, int height, int width,
+                        h3_video_encoder_progress progress, void *progress_opaque,
+                        h3_video_latent *output, float *stats,
+                        char *error, size_t error_size) {
+    if (!stats) {
+        if (error && error_size) snprintf(error, error_size,
+                                          "invalid visual encoder arguments");
+        return 0;
+    }
+    return encode_common(weight_directory, shader_source_path, pixels, 1,
+                         height, width, 1, NULL, stats, progress,
+                         progress_opaque, output, error, error_size);
+}
+
+void h3_video_vae_sample_image_moments(h3_video_latent *latent,
+                                       const float *posterior_noise,
+                                       const float *stats) {
+    sample_moments(latent, posterior_noise, stats, stats + LATENT_CHANNELS);
 }
 
 void h3_video_latent_free(h3_video_latent *latent) {

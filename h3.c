@@ -8,6 +8,7 @@
 #include "h3_multimodal.h"
 #include "h3_resume.h"
 #include "h3_safetensors.h"
+#include "h3_te_cache.h"
 #include "h3_text_encoder.h"
 #include "h3_tokenizer.h"
 #include "h3_video_encoder.h"
@@ -1662,6 +1663,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     /* Built fresh for this generation, before anything is loaded: a fatal
      * LoRA stops the run instead of delivering a video without it. */
     if (!h3_lora_set_build(ctx, params, &loras)) goto cleanup;
+    h3_tc_begin(ctx->model_dir);
     conditioning_key = h3_conditioning_key(
         prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {
@@ -1912,7 +1914,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             }
             h3_audio_latent latent;
             memset(&latent, 0, sizeof(latent));
-            if (!h3_audio_vae_encode(
+            if (!h3_tc_audio_vae_encode(
                     audio_vae_path, "h3_shaders.metal", pcm, samples,
                     h3_audio_encoder_progress_bridge, &progress, &latent,
                     detail, sizeof(detail))) {
@@ -2045,7 +2047,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                   (size_t)image_latent_w / 4 * 96;
             h3_video_latent latent;
             memset(&latent, 0, sizeof(latent));
-            if (!h3_video_vae_encode(
+            if (!h3_tc_video_vae_encode(
                     vae_path, "h3_shaders.metal", condition_pixels[image],
                     condition_frames[image], condition_heights[image],
                     condition_widths[image],
@@ -2085,7 +2087,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             size_t reference_index = visual_reference_indices[image];
             if (!ref2va ||
                 params->references[reference_index].kind == H3_REFERENCE_IMAGE) {
-                if (!h3_vision_encode_bf16(
+                if (!h3_tc_vision_encode(
                         text_path, "h3_shaders.metal", condition_pixels[image],
                         1, condition_heights[image], condition_widths[image],
                         h3_vision_progress_bridge, &progress,
@@ -2117,7 +2119,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                             "out of memory extracting Qwen video pair");
                         goto cleanup;
                     }
-                    int ok = h3_vision_encode_bf16(
+                    int ok = h3_tc_vision_encode(
                         text_path, "h3_shaders.metal", pair, 2,
                         condition_heights[image], condition_widths[image],
                         h3_vision_progress_bridge, &progress,
@@ -2140,12 +2142,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         h3_progress_emit(&progress, "text encoder", 0, 50);
-        int text_ok = ref2va ? h3_multimodal_encode_ref2va_bf16(
+        int text_ok = ref2va ? h3_tc_ref2va(tokenizer_path,
                 tokenizer, text_path, "h3_shaders.metal", prompt,
                 presentations, params->reference_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail)) :
-            h3_multimodal_encode_fl2va_bf16(
+            h3_tc_fl2va(tokenizer_path,
                 tokenizer, text_path, "h3_shaders.metal", prompt,
                 vision_outputs, visual_count,
                 h3_text_progress_bridge, &progress, &text,
@@ -2163,7 +2165,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         h3_progress_emit(&progress, "text encoder", 0, 50);
-        if (!h3_text_encode_bf16(
+        if (!h3_tc_text_encode(
                 text_path, "h3_shaders.metal", ids, token_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail))) {
@@ -2171,6 +2173,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    h3_tc_report();
     conditioned = visual_count != 0 || condition_audio_elements != 0;
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
@@ -2751,7 +2754,7 @@ static int h3_image_encode_reference(
     snprintf(name, sizeof(name), "ref%zu_vision_pixels.f32", index + 1);
     h3_image_dump(name, pixels,
                   (size_t)3 * vision_w * vision_h * sizeof(*pixels));
-    if (!h3_vision_encode_bf16(text_path, "h3_shaders.metal", pixels, 1,
+    if (!h3_tc_vision_encode(text_path, "h3_shaders.metal", pixels, 1,
                                vision_h, vision_w, h3_vision_progress_bridge,
                                progress, vision, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
@@ -2821,7 +2824,7 @@ static int h3_image_encode_reference(
     h3_image_dump(name, posterior_noise, full_count * sizeof(*posterior_noise));
     snprintf(name, sizeof(name), "ref%zu_noise.f32", index + 1);
     h3_image_dump(name, noise, count * sizeof(*noise));
-    if (!h3_video_vae_encode_image_sampled(
+    if (!h3_tc_video_vae_encode_image_sampled(
             vae_path, "h3_shaders.metal", encoder_pixels, crop_h, crop_w,
             posterior_noise, h3_video_encoder_progress_bridge, progress,
             &latent, detail, sizeof(detail))) {
@@ -2986,6 +2989,7 @@ h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
 
+    h3_tc_begin(ctx->model_dir);
     h3_progress_emit(&progress, "tokenizer", 0, 1);
     tokenizer = h3_tokenizer_load(tokenizer_path, detail, sizeof(detail));
     if (!tokenizer) {
@@ -3012,7 +3016,7 @@ h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
                       condition_elements * sizeof(*condition_rows));
         h3_progress_emit(&progress, "tokenizer", 1, 1);
         h3_progress_emit(&progress, "text encoder", 0, 50);
-        if (!h3_multimodal_encode_image_edit_bf16(
+        if (!h3_tc_image_edit(tokenizer_path,
                 tokenizer, text_path, "h3_shaders.metal", prompt,
                 H3_IMAGE_MAX_TEXT_TOKENS, visions, reference_count,
                 h3_text_progress_bridge, &progress, &text,
@@ -3038,13 +3042,14 @@ h3_result *h3_generate_image(h3_ctx *ctx, const char *prompt,
     }
     h3_image_dump("tokens.u32", ids, token_count * sizeof(*ids));
     h3_progress_emit(&progress, "text encoder", 0, 50);
-    if (!h3_text_encode_bf16(text_path, "h3_shaders.metal", ids, token_count,
+    if (!h3_tc_text_encode(text_path, "h3_shaders.metal", ids, token_count,
                              h3_text_progress_bridge, &progress, &text,
                              detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
     }
+    h3_tc_report();
     if (getenv("H3_IMAGE_DUMP")) {
         size_t n = text.tokens * text.width;
         float *values = malloc(n * sizeof(*values));

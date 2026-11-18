@@ -39,6 +39,20 @@ int h3_video_vae_encode_image_sampled(
                         h3_video_encoder_progress progress, void *progress_opaque,
                         h3_video_latent *output,
                         char *error, size_t error_size);
+/* te_cache: the GPU half of h3_video_vae_encode_image_sampled. Output keeps
+ * the blended [48,1,H,W] moments (mean, then log-variance), stats receives the
+ * 24 latents_mean then the 24 latents_std. sample_image_moments draws in place
+ * exactly as encode_image_sampled does. */
+int h3_video_vae_encode_image_moments(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const float *pixels, int height, int width,
+                        h3_video_encoder_progress progress, void *progress_opaque,
+                        h3_video_latent *output, float *stats,
+                        char *error, size_t error_size);
+void h3_video_vae_sample_image_moments(h3_video_latent *latent,
+                                       const float *posterior_noise,
+                                       const float *stats);
 void h3_video_latent_free(h3_video_latent *latent);
 
 #endif
